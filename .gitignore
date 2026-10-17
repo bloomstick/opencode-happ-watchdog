@@ -1,0 +1,11 @@
+# runtime state and logs
+state.json
+failover.log
+*.log
+
+# cached per-server xray configs - CONTAIN CONNECTION CREDENTIALS, never commit
+configs/
+
+# local helpers and shortcuts
+test-*.ps1
+*.lnk
