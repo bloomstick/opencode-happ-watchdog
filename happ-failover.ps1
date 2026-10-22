@@ -2127,6 +2127,7 @@ function Render-BansEditor {
         [Console]::ResetColor()
         [Console]::SetCursorPosition(0, [Math]::Max(0, $h - 1))
     } catch {
+        try { [Console]::ResetColor() } catch { }
         try {
             $pos = ''
             try { if ($_.InvocationInfo) { $pos = ' at ' + (Split-Path -Leaf $_.InvocationInfo.ScriptName) + ':' + $_.InvocationInfo.ScriptLineNumber } } catch { }
