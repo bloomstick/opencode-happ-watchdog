@@ -123,6 +123,14 @@ unbanned groups. The editor runs as a fast modal loop (25 ms input polling) so m
 stays responsive; automatic watchdog polling pauses while it is open and resumes on
 close (the daemon heartbeat continues).
 
+Happ sometimes exposes several names for the same `host:port` (or a memory capture is
+malformed). The editor lists those names as separate alias rows marked `~`; they share
+one cache template and one ban, so pressing `Enter` on any alias bans the endpoint for
+all of them. The cache is endpoint-keyed, so profiles with identical `host:port` cannot
+be selected independently. The editor is not a browser for the whole Happ subscription:
+only endpoints whose full xray config has been captured (or that are active, used, or
+banned) can appear.
+
 ### Active server tracking
 
 The Happ registry only changes when the Happ GUI itself changes server; a pipe-based

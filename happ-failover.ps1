@@ -1,4 +1,4 @@
-#Requires -Version 5.1
+﻿#Requires -Version 5.1
 <#
 .SYNOPSIS
   happ-failover watchdog: on OpenCode rate-limit errors (provider limits plus the
@@ -665,27 +665,41 @@ function Update-ConfigCache {
     $hits = [MemApi]::Scan($gui.Id, $needles, 150, 300, 26000)
     Log ("memory scan: " + $hits.Count + " hits")
     $saved = 0
+    $aliases = 0
     $total = (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue).Count
     foreach ($hit in $hits) {
         $text = [Text.Encoding]::UTF8.GetString($hit.Data)
         foreach ($o in (Get-JsonConfigFromText $text)) {
-            foreach ($ob in $o.outbounds) {
-                if ($ob.protocol -in @('vless','hysteria','vmess','trojan') -and $ob.settings -and $ob.settings.vnext -and $ob.settings.vnext[0]) {
-                    $key = ('{0}_{1}' -f $ob.settings.vnext[0].address, $ob.settings.vnext[0].port)
-                    $file = Join-Path $Script:Cfg.ConfigCacheDir ($key + '.json')
-                    if (-not (Test-Path $file)) {
-                        try {
-                            $o | ConvertTo-Json -Depth 30 | Set-Content $file -Encoding utf8
-                            $saved++; $total++
-                            Log ("cached config: " + $key)
-                        } catch { Log ("cache save failed " + $key + ": " + $_.Exception.Message) }
-                    }
+            Repair-CacheConfigKeys $o
+            foreach ($ob in @($o.outbounds)) {
+                if ($ob.protocol -notin @('vless','hysteria','vmess','trojan') -or -not $ob.settings -or -not $ob.settings.vnext -or -not $ob.settings.vnext[0]) { continue }
+                $addr = ''
+                $port = 0
+                try {
+                    $addr = [string]$ob.settings.vnext[0].address
+                    $port = [int]$ob.settings.vnext[0].port
+                } catch { }
+                if (-not $addr -or $port -lt 1 -or $port -gt 65535) {
+                    Log ("cache skip: captured config has no usable address (remarks '" + ([string]$o.remarks) + "')")
+                    continue
+                }
+                $key = ('{0}_{1}' -f $addr, $port)
+                $file = Join-Path $Script:Cfg.ConfigCacheDir ($key + '.json')
+                if (-not (Test-Path $file)) {
+                    try {
+                        $o | ConvertTo-Json -Depth 30 | Set-Content $file -Encoding utf8
+                        $saved++; $total++
+                        Log ("cached config: " + $key)
+                    } catch { Log ("cache save failed " + $key + ": " + $_.Exception.Message) }
+                } elseif (Add-CacheAlias $file ([string]$o.remarks)) {
+                    $aliases++
+                    Log ("cached alias: " + ([string]$o.remarks) + " -> " + $key)
                 }
             }
         }
     }
-    Log ("config cache scan done: new=$saved total=$total")
-    return $saved
+    Log ("config cache scan done: new=$saved aliases=$aliases total=$total")
+    return ($saved + $aliases)
 }
 
 function Get-ServerFromCacheKey([string]$key) {
@@ -833,6 +847,7 @@ function Get-CachedOutbound {
     if (-not (Test-Path $file)) { return $null }
     try {
         $tpl = Get-Content $file -Raw | ConvertFrom-Json
+        Repair-CacheConfigKeys $tpl
         foreach ($ob in $tpl.outbounds) {
             if ($ob.protocol -in @('vless','hysteria','vmess','trojan') -and $ob.settings -and $ob.settings.vnext) {
                 $v = $ob.settings.vnext[0]
@@ -851,6 +866,111 @@ function Get-CachedServerName([string]$srvHost, [int]$srvPort) {
         if ($cfg.remarks) { return ([string]$cfg.remarks).Trim() }
     } catch { }
     return ''
+}
+
+function Repair-CacheConfigKeys([object]$obj) {
+    # Memory captures occasionally contain a control byte where one letter of a
+    # JSON key was overwritten. Recover the two keys that matter for endpoint
+    # extraction. Without this a config can land in the cache as "_443.json".
+    if ($null -eq $obj) { return }
+    if ($obj -is [System.Collections.IList] -and $obj -isnot [string]) {
+        foreach ($x in @($obj)) { Repair-CacheConfigKeys $x }
+        return
+    }
+    if ($obj -is [System.Management.Automation.PSCustomObject]) {
+        foreach ($prop in @($obj.PSObject.Properties)) {
+            $key = [string]$prop.Name
+            $fixed = $key
+            if ($key -match '^add[\x00-\x1F]ess$') { $fixed = 'address' }
+            elseif ($key -match '^stre[\x00-\x1F]mSettings$') { $fixed = 'streamSettings' }
+            if ($fixed -ne $key) {
+                $value = $prop.Value
+                try { $obj.PSObject.Properties.Remove($key) } catch { }
+                Add-Member -InputObject $obj -NotePropertyName $fixed -NotePropertyValue $value -Force
+            }
+            Repair-CacheConfigKeys $prop.Value
+        }
+    }
+}
+
+function Get-CachedConfigMeta([object]$cfg) {
+    $remarks = ''
+    try { $remarks = ([string]$cfg.remarks).Trim() } catch { }
+    foreach ($ob in @($cfg.outbounds)) {
+        if (-not $ob -or $ob.protocol -notin @('vless','vmess','trojan','hysteria')) { continue }
+        $addr = ''
+        $port = 0
+        try {
+            if ($ob.settings.vnext -and $ob.settings.vnext[0]) {
+                $v = $ob.settings.vnext[0]
+                if ($v.address) { $addr = [string]$v.address }
+                if ($v.port) { $port = [int]$v.port }
+            } elseif ($ob.settings.address) {
+                $addr = [string]$ob.settings.address
+                if ($ob.settings.port) { $port = [int]$ob.settings.port }
+            }
+        } catch { }
+        if ($addr -and $port -ge 1 -and $port -le 65535) {
+            return [pscustomobject]@{ host = $addr; port = $port; remarks = $remarks }
+        }
+    }
+    return $null
+}
+
+function Get-CachedServerAliasMap {
+    # Endpoint -> every captured display name for that endpoint. A valid
+    # host_port file is the primary name; malformed files (e.g. a corrupted
+    # address) and remarksAliases contribute alternate names.
+    $map = @{}
+    $files = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    foreach ($f in $files) {
+        if ($f.BaseName -notmatch '^(.+)_(\d+)$') { continue }
+        $key = $Matches[1] + ':' + $Matches[2]
+        try { $cfg = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        Repair-CacheConfigKeys $cfg
+        if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.Generic.List[string] }
+        $names = @()
+        try { if ($cfg.remarks) { $names += ([string]$cfg.remarks).Trim() } } catch { }
+        try { foreach ($a in @($cfg.remarksAliases)) { if ($a) { $names += ([string]$a).Trim() } } } catch { }
+        foreach ($n in $names) {
+            if ($n -and -not $map[$key].Contains($n)) { $map[$key].Add($n) }
+        }
+    }
+    foreach ($f in $files) {
+        if ($f.BaseName -match '^(.+)_(\d+)$') { continue }
+        try { $cfg = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        Repair-CacheConfigKeys $cfg
+        $meta = Get-CachedConfigMeta $cfg
+        if (-not $meta) { continue }
+        $key = $meta.host + ':' + $meta.port
+        if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.Generic.List[string] }
+        $n = ([string]$meta.remarks).Trim()
+        if ($n -and -not $map[$key].Contains($n)) { $map[$key].Add($n) }
+    }
+    return $map
+}
+
+function Add-CacheAlias([string]$file, [string]$name) {
+    $name = ([string]$name).Trim()
+    if (-not $file -or -not $name -or -not (Test-Path $file)) { return $false }
+    try {
+        $cfg = Get-Content $file -Raw | ConvertFrom-Json
+        $primary = ''
+        try { $primary = ([string]$cfg.remarks).Trim() } catch { }
+        if ($name -eq $primary) { return $false }
+        $aliases = @()
+        try { $aliases = @($cfg.remarksAliases | ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ }) } catch { }
+        if ($aliases -contains $name) { return $false }
+        $aliases = @($aliases) + $name
+        $cfg | Add-Member -NotePropertyName remarksAliases -NotePropertyValue @($aliases) -Force
+        $tmp = $file + '.tmp'
+        $cfg | ConvertTo-Json -Depth 30 | Set-Content $tmp -Encoding utf8
+        Move-Item -Force -Path $tmp -Destination $file
+        return $true
+    } catch {
+        Log ("cache alias failed for " + $file + ": " + $_.Exception.Message)
+        return $false
+    }
 }
 
 function Get-LiveServerFromCore {
@@ -910,12 +1030,20 @@ function Get-CurrentTemplate {
     if (-not $Server -or -not $Server.host) { Log 'cannot determine the active server'; return $null }
     $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $Server.host, $Server.port)
     if (Test-Path $file) {
-        try { return (Get-Content $file -Raw | ConvertFrom-Json) } catch { Log ("template parse failed: " + $_.Exception.Message) }
+        try {
+            $tpl = Get-Content $file -Raw | ConvertFrom-Json
+            Repair-CacheConfigKeys $tpl
+            return $tpl
+        } catch { Log ("template parse failed: " + $_.Exception.Message) }
     }
     Log ("active server {0}_{1} not in cache; scanning GUI memory..." -f $Server.host, $Server.port)
     Update-ConfigCache | Out-Null
     if (Test-Path $file) {
-        try { return (Get-Content $file -Raw | ConvertFrom-Json) } catch { }
+        try {
+            $tpl = Get-Content $file -Raw | ConvertFrom-Json
+            Repair-CacheConfigKeys $tpl
+            return $tpl
+        } catch { }
     }
     Log "active server template unavailable"
     return $null
@@ -1929,16 +2057,40 @@ function Get-ServerFromKey([string]$key) {
 
 function Get-AllKnownServers {
     if (-not $Script:State) { Load-State }
+    $aliasMap = Get-CachedServerAliasMap
     $map = @{}
+    $ensure = {
+        param([string]$hostName, [int]$port, [string]$key)
+        if (-not $key) { $key = '{0}:{1}' -f $hostName, $port }
+        if (-not $map.ContainsKey($key)) {
+            $map[$key] = [pscustomobject]@{
+                host  = [string]$hostName
+                port  = [int]$port
+                key   = [string]$key
+                names = (New-Object System.Collections.Generic.List[string])
+            }
+        }
+        return $map[$key]
+    }
+
     foreach ($srv in @(Get-CachedServerList)) {
         $key = Get-ServerKey $srv
-        if (-not $key -or $map.ContainsKey($key)) { continue }
-        $name = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port))).Trim()
-        $map[$key] = [pscustomobject]@{
-            host = [string]$srv.host
-            port = [int]$srv.port
-            key  = $key
-            name = $name
+        if (-not $key) { continue }
+        $null = & $ensure ([string]$srv.host) ([int]$srv.port) $key
+    }
+    # names captured for this endpoint (primary file + aliases + recovered
+    # malformed captures such as a corrupted "_443.json")
+    foreach ($key in @($aliasMap.Keys)) {
+        if (-not $map.ContainsKey($key)) { continue }
+        $rec = $map[$key]
+        foreach ($n in @($aliasMap[$key])) {
+            if ($n -and -not $rec.names.Contains($n)) { $rec.names.Add($n) }
+        }
+    }
+    foreach ($rec in @($map.Values)) {
+        if ($rec.names.Count -eq 0) {
+            $n = ([string](Get-CachedServerName ([string]$rec.host) ([int]$rec.port))).Trim()
+            if ($n) { $rec.names.Add($n) }
         }
     }
 
@@ -1946,32 +2098,22 @@ function Get-AllKnownServers {
     if ($active) {
         $aKey = Get-ServerKey $active
         if ($aKey) {
+            $rec = & $ensure ([string]$active.host) ([int]$active.port) $aKey
             $aName = ([string]$active.name).Trim()
-            if ($map.ContainsKey($aKey)) {
-                if (-not $map[$aKey].name -and $aName) { $map[$aKey].name = $aName }
-            } else {
-                if (-not $aName) { $aName = ([string](Get-CachedServerName ([string]$active.host) ([int]$active.port))).Trim() }
-                $map[$aKey] = [pscustomobject]@{
-                    host = [string]$active.host
-                    port = [int]$active.port
-                    key  = $aKey
-                    name = $aName
-                }
-            }
+            if (-not $aName) { $aName = ([string](Get-CachedServerName ([string]$active.host) ([int]$active.port))).Trim() }
+            if ($aName -and -not $rec.names.Contains($aName)) { $rec.names.Add($aName) }
         }
     }
 
     $addKey = {
         param([string]$key)
-        if (-not $key -or $map.ContainsKey($key)) { return }
+        if (-not $key) { return }
         $srv = Get-ServerFromKey $key
         if (-not $srv) { return }
-        $name = ([string](Get-CachedServerName $srv.host $srv.port)).Trim()
-        $map[$key] = [pscustomobject]@{
-            host = $srv.host
-            port = [int]$srv.port
-            key  = $key
-            name = $name
+        $rec = & $ensure ([string]$srv.host) ([int]$srv.port) $key
+        if ($rec.names.Count -eq 0) {
+            $n = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port))).Trim()
+            if ($n) { $rec.names.Add($n) }
         }
     }
     foreach ($ban in @(Get-BannedEntries)) { & $addKey ([string]$ban.Name) }
@@ -1983,23 +2125,34 @@ function Get-AllKnownServers {
 
     $curKey = $null
     if ($active) { $curKey = Get-ServerKey $active }
-    $rows = foreach ($srv in $map.Values) {
-        $banned = Test-ServerBanned $srv.key
+    $rows = New-Object System.Collections.Generic.List[object]
+    foreach ($rec in $map.Values) {
+        $names = @($rec.names | Where-Object { $_ })
+        if (-not $names.Count) { $names = @('') }
+        $banned = Test-ServerBanned $rec.key
         $used = $false
-        try { $used = [bool]$Script:State.used.PSObject.Properties[$srv.key] } catch { }
-        [pscustomobject]@{
-            host       = $srv.host
-            port       = $srv.port
-            key        = $srv.key
-            name       = $srv.name
-            banned     = $banned
-            current    = ($srv.key -eq $curKey)
-            used       = $used
-            sortBanned = $(if ($banned) { 0 } else { 1 })
-            sortName   = $(if ($srv.name) { $srv.name.ToLowerInvariant() } else { $srv.key.ToLowerInvariant() })
+        try { $used = [bool]$Script:State.used.PSObject.Properties[$rec.key] } catch { }
+        $current = ($rec.key -eq $curKey)
+        for ($i = 0; $i -lt $names.Count; $i++) {
+            $nm = [string]$names[$i]
+            $primary = [string]$names[0]
+            $rows.Add([pscustomobject]@{
+                host       = $rec.host
+                port       = [int]$rec.port
+                key        = $rec.key
+                uid        = ($rec.key + '#' + $nm + '#' + $i)
+                name       = $nm
+                aliasOf    = $(if ($i -gt 0) { $primary } else { '' })
+                isAlias    = ($i -gt 0)
+                banned     = $banned
+                current    = $current
+                used       = $used
+                sortBanned = $(if ($banned) { 0 } else { 1 })
+                sortName   = $(if ($nm) { $nm.ToLowerInvariant() } else { $rec.key.ToLowerInvariant() })
+            })
         }
     }
-    return @($rows | Sort-Object sortBanned, sortName, key)
+    return @($rows | Sort-Object sortBanned, sortName, key, uid)
 }
 
 function Refresh-BansEditor {
@@ -2008,7 +2161,8 @@ function Refresh-BansEditor {
     try {
         $old = @($Script:BansEditor.Items)
         if ($old.Count -gt 0 -and $Script:BansEditor.Index -ge 0 -and $Script:BansEditor.Index -lt $old.Count) {
-            $selectedKey = [string]$old[$Script:BansEditor.Index].key
+            $selectedKey = [string]$old[$Script:BansEditor.Index].uid
+            if (-not $selectedKey) { $selectedKey = [string]$old[$Script:BansEditor.Index].key }
         }
     } catch { }
     $oldSuppress = $Script:SuppressRender
@@ -2021,7 +2175,9 @@ function Refresh-BansEditor {
     $idx = 0
     if ($selectedKey) {
         for ($i = 0; $i -lt $items.Count; $i++) {
-            if ([string]$items[$i].key -eq $selectedKey) { $idx = $i; break }
+            $iuid = [string]$items[$i].uid
+            if (-not $iuid) { $iuid = [string]$items[$i].key }
+            if ($iuid -eq $selectedKey) { $idx = $i; break }
         }
     }
     if ($items.Count -eq 0) { $idx = 0 }
@@ -2065,16 +2221,21 @@ function Reorder-BansEditor {
     if (-not $old.Count) { return }
     $selectedKey = $null
     $idx = [int]$Script:BansEditor.Index
-    if ($idx -ge 0 -and $idx -lt $old.Count) { $selectedKey = [string]$old[$idx].key }
+    if ($idx -ge 0 -and $idx -lt $old.Count) {
+        $selectedKey = [string]$old[$idx].uid
+        if (-not $selectedKey) { $selectedKey = [string]$old[$idx].key }
+    }
     foreach ($item in $old) {
         $item.banned = Test-ServerBanned $item.key
         $item.sortBanned = $(if ($item.banned) { 0 } else { 1 })
     }
-    $items = @($old | Sort-Object sortBanned, sortName, key)
+    $items = @($old | Sort-Object sortBanned, sortName, key, uid)
     $newIdx = 0
     if ($selectedKey) {
         for ($i = 0; $i -lt $items.Count; $i++) {
-            if ([string]$items[$i].key -eq $selectedKey) { $newIdx = $i; break }
+            $iuid = [string]$items[$i].uid
+            if (-not $iuid) { $iuid = [string]$items[$i].key }
+            if ($iuid -eq $selectedKey) { $newIdx = $i; break }
         }
     }
     $Script:BansEditor.Items = $items
@@ -2181,8 +2342,14 @@ function Render-BansEditor {
         elseif ($idx -lt 0) { $idx = 0 }
         elseif ($idx -ge $count) { $idx = $count - 1 }
         $Script:BansEditor.Index = $idx
-        $bannedCount = 0
-        foreach ($it in $items) { if ($it.banned) { $bannedCount++ } }
+        $bannedKeys = @{}
+        $endpointKeys = @{}
+        foreach ($it in $items) {
+            if ($it.key) { $endpointKeys[$it.key] = $true }
+            if ($it.banned -and $it.key) { $bannedKeys[$it.key] = $true }
+        }
+        $bannedCount = $bannedKeys.Count
+        $endpointCount = $endpointKeys.Count
 
         $hdrRows = 3
         $ftrRows = 1
@@ -2199,7 +2366,7 @@ function Render-BansEditor {
 
         $rows = New-Object System.Collections.Generic.List[object]
         $rows.Add([pscustomobject]@{
-            Text = ('BANS / SERVERS   total {0}   banned {1}   showing {2}-{3}   [Up/Down] move   [Enter] toggle   [R] rescan   [Esc/L] close' -f $count, $bannedCount, $first, $last)
+            Text = ('BANS/SERVERS   {0} rows / {1} endpoints   banned {2}   {3}-{4}   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $count, $endpointCount, $bannedCount, $first, $last)
             Fg   = [ConsoleColor]::Cyan
             Bg   = [ConsoleColor]::Black
         })
@@ -2209,7 +2376,7 @@ function Render-BansEditor {
             Bg   = [ConsoleColor]::Black
         })
         $rows.Add([pscustomobject]@{
-            Text = '  STATE     CUR NAME                              HOST:PORT                 USED'
+            Text = '  STATE     CUR~ NAME                             HOST:PORT                 USED   (~ = same endpoint)'
             Fg   = [ConsoleColor]::DarkGray
             Bg   = [ConsoleColor]::Black
         })
@@ -2221,9 +2388,10 @@ function Render-BansEditor {
             $selMark = $(if ($selected) { '>' } else { ' ' })
             $curMark = $(if ($item.current) { '*' } else { ' ' })
             $usedMark = $(if ($item.used) { 'used' } else { '    ' })
+            $aliasMark = $(if ($item.isAlias) { '~' } else { ' ' })
             $name = [string]$item.name
             if (-not $name) { $name = '(unnamed)' }
-            $prefix = ('{0} {1} {2} ' -f $selMark, $status, $curMark)
+            $prefix = ('{0} {1} {2}{3} ' -f $selMark, $status, $curMark, $aliasMark)
             $suffix = ('  {0}  {1}' -f $item.key, $usedMark)
             $avail = [Math]::Max(8, $w - $prefix.Length - $suffix.Length)
             if ($name.Length -gt $avail) {
@@ -2260,7 +2428,12 @@ function Render-BansEditor {
             $sel = $items[$idx]
             $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
             $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
-            $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $action)
+            if ($sel.isAlias) {
+                $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(primary)' })
+                $footer = ('Alias: {0}  ({1}) = same endpoint as {2}; {3} affects the shared endpoint   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $action)
+            } else {
+                $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $action)
+            }
         }
         $rows.Add([pscustomobject]@{ Text = $footer; Fg = [ConsoleColor]::Cyan; Bg = [ConsoleColor]::Black })
 
