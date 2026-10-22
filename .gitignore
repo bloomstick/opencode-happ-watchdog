@@ -1,5 +1,7 @@
 # runtime state and logs
 state.json
+bans.json
+bans.json.tmp
 failover.log
 *.log
 

@@ -1,17 +1,17 @@
 #Requires -Version 5.1
 <#
 .SYNOPSIS
-  opencode-happ-watchdog: on OpenCode provider errors (rate limits, dead
-  connections, endpoint failures, a dead tunnel), rotate Happ to a previously
-  unused server (via the happd named-pipe protocol), restart OpenCode, and send
+  happ-failover watchdog: on OpenCode rate-limit errors (provider limits plus the
+  per-IP free usage limit listed in the RateLimitPattern), switch Happ to a random
+  previously unused, unbanned server (via the happd named-pipe protocol), fully restart
+  the OpenCode desktop app (stop before changing the server, start after), and send
   "continue" prompts to the affected top-level sessions.
 
 .DESCRIPTION
   Reverse-engineered and verified in live use:
    - happd named pipe \\.\pipe\happd-<session>: 4-byte BIG-ENDIAN length + compact JSON
-   - actions: client-hello, get-privilege, list, stop, kill, start, stdin, close-stdin, heartbeat, start-tun
+   - actions: client-hello, get-privilege, list, stop, kill, start, stdin, close-stdin, heartbeat
    - xray.exe is spawned by the daemon with no args; config is delivered via a 'stdin' action
-   - the system-wide TUN comes from a start-tun action that spawns sing-box.exe -c %LOCALAPPDATA%\Happ\config.json
    - the GUI process (Happ.exe) keeps generated xray configs in memory -> templates & server params
    - HKCU\Software\Happ\OrganizationDefaults\Preferences holds lastServer* (current server)
 
@@ -20,6 +20,10 @@
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -TestSwitch
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -TestSessions
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -TestProbe
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -Watch
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -BanServer host:port
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnbanServer host:port
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBanned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -Watch [-Interactive] [-ProjectDir <dir>]
 #>
 param(
@@ -30,6 +34,9 @@ param(
     [switch]$SwitchProbe,
     [switch]$Watch,
     [switch]$Interactive,
+    [string]$BanServer,
+    [string]$UnbanServer,
+    [switch]$ListBanned,
     [int]$PollSeconds = 5,
     [int]$CooldownSec = 120,
     [string]$ProjectDir = ''
@@ -41,6 +48,7 @@ $ErrorActionPreference = 'Continue'
 $Script:Cfg = @{
     ToolDir           = $PSScriptRoot
     StatePath         = (Join-Path $PSScriptRoot 'state.json')
+    BansPath          = (Join-Path $PSScriptRoot 'bans.json')
     LogPath           = (Join-Path $PSScriptRoot 'failover.log')
     ConfigCacheDir    = (Join-Path $PSScriptRoot 'configs')
     OpLogPath         = "$env:USERPROFILE\.local\share\opencode\log\opencode.log"
@@ -52,9 +60,9 @@ $Script:Cfg = @{
     XrayWorkDir       = 'C:\Program Files\FlyFrogLLC\Happ\core'
     ProcessId         = 'xray-core'
     ContinueText      = 'continue'
-    RateLimitPattern  = '(Rate limit exceeded|Too many requests)'
+    RateLimitPattern  = '(Rate limit exceeded|Too many requests|Free usage limit reached|Free usage exceeded)'
     EndpointPattern   = 'Endpoint is unavailable'
-    ContinueDelaySec  = 5     # wait after service (re)connect before continue prompts
+    ContinueDelaySec  = 5     # wait after app/service (re)connect before continue prompts
     RestartOpenCode   = $true
     TopLevelOnly      = $true
     MaxSwitchAttempts = 6
@@ -64,6 +72,10 @@ $Script:Cfg = @{
     TunAddress         = '172.18.0.1/30'
     TunAddressV6       = 'fd6e:a81b:704f:1211::2'
     TunDns             = '1.1.1.1'
+    OpenCodeExe       = "$env:LOCALAPPDATA\Programs\@opencodedesktop\OpenCode.exe"
+    OpenCodeProcess   = 'OpenCode'
+    OpenCodeStopSec   = 20
+    OpenCodeStartSec  = 120
     HeartbeatSec      = 15
     WebCheckUrl       = 'https://api.ipify.org/?format=json'
     AffectedWindowMin = 120
@@ -76,6 +88,10 @@ $Script:Cfg = @{
     ProbeTimeoutSec    = 8
 }
 
+# public: resolve the OpenCode project context (defaults to the launch directory)
+if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
+$Script:Cfg.ProjectDir = $ProjectDir
+
 foreach ($p in @($Script:Cfg.ToolDir, $Script:Cfg.ConfigCacheDir)) {
     if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
 }
@@ -86,10 +102,6 @@ $Script:EventRing = New-Object System.Collections.Generic.List[string]
 $Script:RingCap = 400
 $Script:LastWinW = -1
 $Script:LastWinH = -1
-
-# public: resolve the OpenCode project context (defaults to the launch directory)
-if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
-$Script:Cfg.ProjectDir = $ProjectDir
 
 function Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
@@ -102,19 +114,120 @@ function Log([string]$msg) {
 }
 
 # ------------------------------------------------------------------- state
+function Initialize-StateMaps {
+    $changed = $false
+    foreach ($name in @('used','prompted')) {
+        $prop = $Script:State.PSObject.Properties[$name]
+        if (-not $prop -or $null -eq $prop.Value) {
+            Add-Member -InputObject $Script:State -NotePropertyName $name -NotePropertyValue (New-Object PSObject) -Force
+            $changed = $true
+        }
+    }
+    return $changed
+}
 function Load-State {
     if (Test-Path $Script:Cfg.StatePath) {
         try { $Script:State = Get-Content $Script:Cfg.StatePath -Raw | ConvertFrom-Json } catch { $Script:State = $null }
     }
-    if ($null -eq $Script:State) {
-        $Script:State = New-Object PSObject
-        Add-Member -InputObject $Script:State -NotePropertyName used -NotePropertyValue (New-Object PSObject) -Force
-        Add-Member -InputObject $Script:State -NotePropertyName prompted -NotePropertyValue (New-Object PSObject) -Force
-        Save-State
-    }
+    if ($null -eq $Script:State) { $Script:State = New-Object PSObject }
+    if (Initialize-StateMaps) { Save-State }
+    Load-Bans
 }
 function Save-State {
     try { $Script:State | ConvertTo-Json -Depth 8 | Set-Content $Script:Cfg.StatePath -Encoding utf8 } catch { Log "state save failed: $_" }
+}
+
+# ------------------------------------------------------------------- bans
+# Bans are deliberately kept in their own file: clearing "used" must never
+# clear them, and an external -BanServer write must not be overwritten by the
+# watchdog saving state.json.
+function Load-Bans {
+    $map = $null
+    if (Test-Path $Script:Cfg.BansPath) {
+        try {
+            $text = Get-Content $Script:Cfg.BansPath -Raw
+            if (-not [string]::IsNullOrWhiteSpace($text)) {
+                $raw = $text | ConvertFrom-Json
+                if ($raw -is [array]) { Log 'bans file is not a JSON object - keeping the current ban list' }
+                elseif ($raw -is [System.Management.Automation.PSCustomObject]) { $map = $raw }
+                else { Log 'bans file is not a JSON object - keeping the current ban list' }
+            } else {
+                Log 'bans file is empty - keeping the current ban list'
+            }
+        } catch { Log ("bans load failed: " + $_.Exception.Message) }
+    } else {
+        $map = New-Object PSObject
+    }
+    if ($null -ne $map) { $Script:Bans = $map }
+    elseif (-not $Script:Bans) { $Script:Bans = New-Object PSObject }
+}
+function Save-Bans {
+    try {
+        $tmp = $Script:Cfg.BansPath + '.tmp'
+        $Script:Bans | ConvertTo-Json -Depth 4 | Set-Content $tmp -Encoding utf8
+        Move-Item -Force -Path $tmp -Destination $Script:Cfg.BansPath
+    } catch {
+        Log "bans save failed: $_"
+        try { Remove-Item ($Script:Cfg.BansPath + '.tmp') -Force -ErrorAction SilentlyContinue } catch { }
+    }
+}
+function Get-ServerKey([object]$srv) {
+    if (-not $srv -or -not $srv.host) { return $null }
+    return ('{0}:{1}' -f $srv.host, $srv.port)
+}
+function Test-ServerBanned([string]$key) {
+    if (-not $key) { return $false }
+    if (-not $Script:Bans) { Load-Bans }
+    if (-not $Script:Bans) { return $false }
+    return [bool]$Script:Bans.PSObject.Properties[$key]
+}
+function Get-BannedEntries {
+    if (-not $Script:Bans) { Load-Bans }
+    if (-not $Script:Bans) { return @() }
+    return @($Script:Bans.PSObject.Properties | Sort-Object Name)
+}
+function Add-BannedServer([string]$key, [string]$source = '') {
+    if (-not $key) { return $false }
+    Load-Bans
+    if (Test-ServerBanned $key) {
+        Log ("server is already banned: " + $key)
+        return $false
+    }
+    Add-Member -InputObject $Script:Bans -NotePropertyName $key -NotePropertyValue (Get-Date -Format 'o') -Force
+    Save-Bans
+    Log ("BANNED {0}{1} - it will never be selected again (clear-used does not affect bans)" -f $key, $(if ($source) { ' [' + $source + ']' } else { '' }))
+    return $true
+}
+function Remove-BannedServer([string]$key) {
+    if (-not $key) { return $false }
+    Load-Bans
+    if (-not (Test-ServerBanned $key)) {
+        Log ("server is not banned: " + $key)
+        return $false
+    }
+    $Script:Bans.PSObject.Properties.Remove($key) | Out-Null
+    Save-Bans
+    Log ("UNBANNED " + $key + " - it can be selected again")
+    return $true
+}
+function Resolve-ServerKey([string]$value) {
+    if (-not $value) { return $null }
+    $value = $value.Trim()
+    if ($value -ieq 'current') {
+        $cur = Get-ActiveServer
+        if (-not $cur) { return $null }
+        return (Get-ServerKey $cur)
+    }
+    if ($value -match '^(.+):([0-9]{1,5})$') {
+        $port = [int]$Matches[2]
+        if ($port -ge 1 -and $port -le 65535) { return ('{0}:{1}' -f $Matches[1].Trim(), $port) }
+        return $null
+    }
+    if ($value -match '^(.+)_([0-9]{1,5})$') {
+        $port = [int]$Matches[2]
+        if ($port -ge 1 -and $port -le 65535) { return ('{0}:{1}' -f $Matches[1].Trim(), $port) }
+    }
+    return $null
 }
 
 # ------------------------------------------------------------------- registry
@@ -130,6 +243,127 @@ function Get-HappCurrentServer {
         }
     }
     return $null
+}
+
+# The Happ registry is NOT updated by a pipe-based switch, so it keeps naming
+# the server that was active when the GUI last wrote it. Track the real active
+# endpoint ourselves and only adopt the registry again when its key changes
+# (meaning the user picked a different server in the Happ UI).
+function Format-ServerLabel([object]$srv) {
+    if (-not $srv -or -not $srv.host) { return '(unknown)' }
+    $key = Get-ServerKey $srv
+    $name = ''
+    try { if ($srv.PSObject.Properties['name']) { $name = ([string]$srv.name).Trim() } } catch { }
+    if ($name) { return ('{0} ({1})' -f $key, $name) }
+    return $key
+}
+
+function New-ActiveRecord([object]$srv, [string]$source) {
+    $name = ''
+    try { if ($srv.PSObject.Properties['name']) { $name = [string]$srv.name } } catch { }
+    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) }
+    $name = $name.Trim()
+    return [pscustomobject]@{
+        host   = [string]$srv.host
+        port   = [int]$srv.port
+        name   = $name
+        key    = (Get-ServerKey $srv)
+        since  = (Get-Date -Format 'o')
+        source = $source
+    }
+}
+
+function Get-ActiveServer {
+    if (-not $Script:State) { Load-State }
+    $reg = Get-HappCurrentServer
+    $active = $null
+    $seen = $null
+    try { if ($Script:State.PSObject.Properties['active']) { $active = $Script:State.active } } catch { }
+    try { if ($Script:State.PSObject.Properties['registrySeen']) { $seen = $Script:State.registrySeen } } catch { }
+    if ($active -and -not $active.host) { $active = $null }
+
+    $regKey = $null
+    $regChanged = $false
+    if ($reg -and $reg.host) {
+        $regKey = Get-ServerKey $reg
+        if ($seen -and $seen.host -and ((Get-ServerKey $seen) -ne $regKey)) { $regChanged = $true }
+    }
+
+    $changed = $false
+    $adoptedLive = $false
+    if (-not $active) {
+        # The Happ registry is often blank after a manual reconnect. The running
+        # core still has live outbound connections to the real server, so use the
+        # dominant cached endpoint as a fallback (and to migrate old state).
+        $live = Get-LiveServerFromCore
+        if ($live) {
+            $active = New-ActiveRecord $live 'live'
+            $adoptedLive = $true
+            $changed = $true
+            Log ("active server inferred from running core: {0} ({1} live connections)" -f (Format-ServerLabel $active), $live.connections)
+        }
+    }
+    if ($reg -and $reg.host -and (-not $active -or ($regChanged -and -not $adoptedLive))) {
+        $active = New-ActiveRecord $reg 'registry'
+        $changed = $true
+    }
+
+    if ($reg -and $reg.host) {
+        $seenKey = $null
+        if ($seen -and $seen.host) { $seenKey = Get-ServerKey $seen }
+        if (-not $seen -or $regKey -ne $seenKey -or
+            [string]$seen.guid -ne [string]$reg.guid -or
+            [string]$seen.name -ne [string]$reg.name) {
+            $seen = [pscustomobject]@{
+                guid = [string]$reg.guid
+                name = [string]$reg.name
+                host = [string]$reg.host
+                port = [int]$reg.port
+                key  = $regKey
+            }
+            $changed = $true
+        }
+    }
+
+    if ($changed) {
+        if ($active) { $Script:State | Add-Member -NotePropertyName active -NotePropertyValue $active -Force }
+        if ($seen) { $Script:State | Add-Member -NotePropertyName registrySeen -NotePropertyValue $seen -Force }
+        Save-State
+    }
+    $Script:ActiveServer = $active
+    return $active
+}
+
+function Set-ActiveServer([object]$srv) {
+    if (-not $srv -or -not $srv.host) { return }
+    if (-not $Script:State) { Load-State }
+    $key = Get-ServerKey $srv
+    $name = ''
+    try { if ($srv.PSObject.Properties['name']) { $name = [string]$srv.name } } catch { }
+    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) }
+    if (-not $name) {
+        try {
+            if ($Script:State.active -and (Get-ServerKey $Script:State.active) -eq $key) {
+                $name = [string]$Script:State.active.name
+            }
+        } catch { }
+        if (-not $name) {
+            $reg = Get-HappCurrentServer
+            if ($reg -and (Get-ServerKey $reg) -eq $key) { $name = [string]$reg.name }
+        }
+    }
+    $name = $name.Trim()
+    $rec = [pscustomobject]@{
+        host   = [string]$srv.host
+        port   = [int]$srv.port
+        name   = $name
+        key    = $key
+        since  = (Get-Date -Format 'o')
+        source = 'switch'
+    }
+    $Script:State | Add-Member -NotePropertyName active -NotePropertyValue $rec -Force
+    $Script:ActiveServer = $rec
+    Save-State
 }
 
 # ------------------------------------------------------------------- happd pipe client (burst model)
@@ -453,6 +687,27 @@ function Get-ServerFromCacheKey([string]$key) {
     return [pscustomobject]@{ host = $key.Substring(0, $li); port = [int]$key.Substring($li + 1) }
 }
 
+function Get-CachedServerList {
+    $list = @()
+    foreach ($f in (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
+        try { $srv = Get-ServerFromCacheKey $f.BaseName } catch { $srv = $null }
+        if ($srv) { $list += $srv }
+    }
+    return $list
+}
+
+function Get-ShuffledItems {
+    param([object[]]$Items)
+    $arr = @($Items)
+    for ($i = $arr.Count - 1; $i -gt 0; $i--) {
+        $j = Get-Random -Minimum 0 -Maximum ($i + 1)
+        $tmp = $arr[$i]
+        $arr[$i] = $arr[$j]
+        $arr[$j] = $tmp
+    }
+    return $arr
+}
+
 function Get-CachedOutbound {
     param([string]$srvHost, [int]$srvPort)
     $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort)
@@ -469,19 +724,81 @@ function Get-CachedOutbound {
     return $null
 }
 
+function Get-CachedServerName([string]$srvHost, [int]$srvPort) {
+    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort)
+    if (-not (Test-Path $file)) { return '' }
+    try {
+        $cfg = Get-Content $file -Raw | ConvertFrom-Json
+        if ($cfg.remarks) { return ([string]$cfg.remarks).Trim() }
+    } catch { }
+    return ''
+}
+
+function Get-LiveServerFromCore {
+    # Best-effort fallback for when state and the Happ registry are both blank:
+    # xray keeps many TCP connections to the server it is actually proxying
+    # through. Rank cached endpoints by established connection count and accept
+    # only a clear winner. (UDP-only transports simply fall through.)
+    $now = Get-Date
+    $last = $null
+    try { $last = $Script:LastLiveCoreProbe } catch { }
+    if ($last -and ($now - $last).TotalSeconds -lt 5) { return $null }
+    $Script:LastLiveCoreProbe = $now
+
+    $cached = @{}
+    try {
+        Get-ChildItem -Path $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction Stop | ForEach-Object {
+            if ($_.BaseName -match '^(.+)_(\d+)$') {
+                $cached[($Matches[1] + ':' + $Matches[2])] = $true
+            }
+        }
+    } catch { return $null }
+    if ($cached.Count -eq 0) { return $null }
+
+    $procs = @(Get-Process xray -ErrorAction SilentlyContinue)
+    if (-not $procs) { return $null }
+
+    $counts = @{}
+    foreach ($proc in $procs) {
+        try {
+            $conns = @(Get-NetTCPConnection -OwningProcess $proc.Id -State Established -ErrorAction SilentlyContinue)
+        } catch { continue }
+        foreach ($c in $conns) {
+            if (-not $c.RemoteAddress) { continue }
+            $addr = ([string]$c.RemoteAddress) -replace '^::ffff:', ''
+            $key = ('{0}:{1}' -f $addr, [int]$c.RemotePort)
+            if (-not $cached.ContainsKey($key)) { continue }
+            if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+        }
+    }
+    if ($counts.Count -eq 0) { return $null }
+    $ranked = @($counts.GetEnumerator() | Sort-Object Value -Descending)
+    $top = $ranked[0]
+    if ([int]$top.Value -lt 2) { return $null }
+    if ($ranked.Count -gt 1 -and [int]$ranked[1].Value -ge [int]$top.Value) { return $null }
+    $sep = ([string]$top.Key).LastIndexOf(':')
+    if ($sep -lt 1) { return $null }
+    return [pscustomobject]@{
+        host        = ([string]$top.Key).Substring(0, $sep)
+        port        = [int]([string]$top.Key).Substring($sep + 1)
+        connections = [int]$top.Value
+    }
+}
+
 function Get-CurrentTemplate {
-    $cur = Get-HappCurrentServer
-    if (-not $cur) { Log 'cannot read current Happ server from registry'; return $null }
-    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $cur.host, $cur.port)
+    param([object]$Server)
+    if (-not $Server) { $Server = Get-ActiveServer }
+    if (-not $Server -or -not $Server.host) { Log 'cannot determine the active server'; return $null }
+    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $Server.host, $Server.port)
     if (Test-Path $file) {
         try { return (Get-Content $file -Raw | ConvertFrom-Json) } catch { Log ("template parse failed: " + $_.Exception.Message) }
     }
-    Log ("current server {0}_{1} not in cache; scanning GUI memory..." -f $cur.host, $cur.port)
+    Log ("active server {0}_{1} not in cache; scanning GUI memory..." -f $Server.host, $Server.port)
     Update-ConfigCache | Out-Null
     if (Test-Path $file) {
         try { return (Get-Content $file -Raw | ConvertFrom-Json) } catch { }
     }
-    Log "current server template unavailable"
+    Log "active server template unavailable"
     return $null
 }
 
@@ -603,8 +920,16 @@ function Start-CoreBurst {
 
 function Invoke-PipeSwitch {
     param([pscustomobject]$Target)
-    $template = Get-CurrentTemplate
+    Load-Bans
+    if (Test-ServerBanned (Get-ServerKey $Target)) {
+        Log ("refusing banned server {0}:{1}" -f $Target.host, $Target.port)
+        return $false
+    }
+    $curSrv = Get-ActiveServer
+    $template = Get-CurrentTemplate -Server $curSrv
     if (-not $template) { return $false }
+    $curBanned = $false
+    if ($curSrv) { $curBanned = Test-ServerBanned (Get-ServerKey $curSrv) }
     $newOut = Get-CachedOutbound -srvHost $Target.host -srvPort $Target.port
     if (-not $newOut) { Log ("no cached outbound for {0}:{1}" -f $Target.host, $Target.port); return $false }
 
@@ -640,16 +965,25 @@ function Invoke-PipeSwitch {
     $plainIp = Get-PlainRouteIp
     if ($exitIpAfter) {
         Log ("SWITCH OK -> {0}:{1} (core exit IP: {2}{3}; system route: {4})" -f $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
+        Set-ActiveServer $Target
         return $true
     }
     Log 'exit check failed on the new server - reverting to original config'
     if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
     $Script:OwnedClient = $null; $Script:OwnedBurst = $null
     $null = Invoke-KillCore
+    if ($curBanned) {
+        # Never reconnect to a banned server, even during a failed-switch revert.
+        Log 'original server is banned - refusing to revert; no proxy is active'
+        return $false
+    }
     $Script:OwnedBurst = Start-CoreBurst -configJson $oldJson
     $Script:OwnedClient = if ($Script:OwnedBurst) { $Script:OwnedBurst.Client } else { $null }
     # TUN stays alive across the revert (it forwards into the fixed socks port)
-    if ($Script:OwnedBurst -and (Test-ProxyExit)) { Log 'reverted to original server' } else { Log 'REVERT FAILED - reconnect Happ manually!' }
+    if ($Script:OwnedBurst -and (Test-ProxyExit)) {
+        if ($curSrv) { Set-ActiveServer $curSrv }
+        Log 'reverted to original server'
+    } else { Log 'REVERT FAILED - reconnect Happ manually!' }
     return $false
 }
 
@@ -728,20 +1062,146 @@ function Get-FailedSessions {
     return $result
 }
 
-function Restart-Opencode {
-    Push-Location $Script:Cfg.ProjectDir
-    try {
-        Log 'restarting opencode service...'
-        & opencode service restart 2>$null | Out-Null
-        for ($i = 0; $i -lt 120; $i++) {
-            Start-Sleep -Seconds 1
-            $info = Invoke-OC '/api/info'
-            # /api/info returns the ServerInfo object directly (no data wrapper)
-            if ($info -and ($info.data -or $info.version)) {
-                Log ("opencode service healthy after " + ($i + 1) + "s (pid " + $(if ($info.data) { $info.data.pid } else { $info.pid }) + ")")
+function Get-OpenCodeDesktopProcess {
+    return @(Get-Process -Name $Script:Cfg.OpenCodeProcess -ErrorAction SilentlyContinue)
+}
+
+function Get-OpenCodeServiceProcess {
+    # opencode desktop ships its own service binary; it can outlive the GUI when
+    # the app is force-closed, so treat it as part of the app for restarts.
+    $cliDir = Join-Path $env:APPDATA 'ai.opencode.desktop\cli'
+    return @(Get-Process -Name 'opencode-cli' -ErrorAction SilentlyContinue | Where-Object {
+        try { $_.Path -and $_.Path.StartsWith($cliDir, [System.StringComparison]::OrdinalIgnoreCase) } catch { $false }
+    })
+}
+
+function Get-OpenCodeLeftover {
+    return @(@(Get-OpenCodeDesktopProcess) + @(Get-OpenCodeServiceProcess))
+}
+
+function Stop-OpencodeDesktop {
+    $app = @(Get-OpenCodeDesktopProcess)
+    $svc = @(Get-OpenCodeServiceProcess)
+    if (-not $app.Count -and -not $svc.Count) {
+        Log 'opencode desktop is not running - nothing to stop'
+        return $true
+    }
+
+    # remember the exe actually running (survives app updates / non-default installs)
+    $runningExe = $null
+    try { $runningExe = ($app | Where-Object { $_.Path } | Select-Object -First 1).Path } catch { }
+    if ($runningExe) { $Script:Cfg.OpenCodeExe = $runningExe }
+
+    Log ("stopping opencode desktop ({0} app + {1} service process(es))..." -f $app.Count, $svc.Count)
+    # ask the Electron window to close first so drafts and window state are flushed
+    $main = @($app | Where-Object { $_.MainWindowHandle -ne 0 })
+    if ($main.Count) {
+        foreach ($p in $main) {
+            try { $null = $p.CloseMainWindow() } catch { }
+        }
+        $deadline = (Get-Date).AddSeconds([Math]::Max(2, [int]$Script:Cfg.OpenCodeStopSec))
+        while ((Get-Date) -lt $deadline) {
+            Start-Sleep -Milliseconds 500
+            if (-not @(Get-OpenCodeLeftover).Count) {
+                Log 'opencode desktop closed gracefully'
                 return $true
             }
-            if ($i -gt 0 -and ($i % 15) -eq 0) {
+        }
+    }
+
+    Log 'opencode desktop is still running - forcing shutdown'
+    # Electron can respawn renderer/utility processes while the main process is
+    # still shutting down, so kill in passes until the tree stays gone.
+    for ($pass = 0; $pass -lt 3; $pass++) {
+        $remaining = @(Get-OpenCodeDesktopProcess)
+        if (-not $remaining.Count) { break }
+        foreach ($p in $remaining) {
+            try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {
+                Log ("could not stop opencode pid " + $p.Id + ": " + $_.Exception.Message)
+            }
+        }
+        Start-Sleep -Milliseconds 400
+    }
+    foreach ($p in @(Get-OpenCodeServiceProcess)) {
+        try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {
+            Log ("could not stop opencode service pid " + $p.Id + ": " + $_.Exception.Message)
+        }
+    }
+    for ($i = 0; $i -lt 10; $i++) {
+        Start-Sleep -Milliseconds 500
+        if (-not @(Get-OpenCodeLeftover).Count) {
+            Log 'opencode desktop stopped'
+            return $true
+        }
+    }
+    Log ('opencode desktop is still running (pids: ' + ((@(Get-OpenCodeLeftover) | ForEach-Object { $_.Id }) -join ', ') + ')')
+    return $false
+}
+
+function Start-OpencodeDesktop {
+    $exe = $Script:Cfg.OpenCodeExe
+    if (-not (Test-Path $exe)) {
+        Log ("opencode desktop exe not found at " + $exe + " - falling back to the background service")
+        return (Restart-OpencodeService)
+    }
+
+    if (@(Get-OpenCodeDesktopProcess).Count) {
+        Log 'opencode desktop is already running - waiting for its API'
+    } else {
+        $elevated = $false
+        try {
+            $pri = [Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()
+            $elevated = $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+        } catch { }
+        try {
+            if ($elevated) {
+                # The watchdog is usually elevated for the core kill. Launch through
+                # the interactive shell so the app does not inherit admin rights.
+                Log 'starting opencode desktop via the interactive shell (unelevated)...'
+                Start-Process -FilePath 'explorer.exe' -ArgumentList ('"{0}"' -f $exe) -ErrorAction Stop | Out-Null
+            } else {
+                Log 'starting opencode desktop...'
+                Start-Process -FilePath $exe -WorkingDirectory (Split-Path $exe -Parent) -ErrorAction Stop | Out-Null
+            }
+        } catch {
+            Log ("failed to start opencode desktop: " + $_.Exception.Message)
+            return $false
+        }
+    }
+
+    for ($i = 1; $i -le [int]$Script:Cfg.OpenCodeStartSec; $i++) {
+        Start-Sleep -Seconds 1
+        $info = Invoke-OC '/api/info'
+        # /api/info returns the ServerInfo object directly (no data wrapper)
+        if ($info -and ($info.data -or $info.version)) {
+            if (-not @(Get-OpenCodeDesktopProcess).Count) {
+                Log 'opencode API is up but the desktop app is not running'
+                return $false
+            }
+            Log ("opencode desktop healthy after {0}s (pid {1})" -f $i, $(if ($info.data) { $info.data.pid } else { $info.pid }))
+            return $true
+        }
+        if (($i % 15) -eq 0) {
+            Log ("still waiting for opencode desktop ({0}s of {1}s)..." -f $i, $Script:Cfg.OpenCodeStartSec)
+        }
+    }
+    Log 'opencode desktop failed to come back'
+    return $false
+}
+
+function Restart-OpencodeService {
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        Log 'restarting opencode background service...'
+        & opencode service restart 2>$null | Out-Null
+        for ($i = 1; $i -le 120; $i++) {
+            Start-Sleep -Seconds 1
+            $info = Invoke-OC '/api/info'
+            if ($info -and ($info.data -or $info.version)) {
+                Log ("opencode service healthy after " + $i + "s (pid " + $(if ($info.data) { $info.data.pid } else { $info.pid }) + ")")
+                return $true
+            }
+            if (($i % 15) -eq 0) {
                 Log ("still waiting for the opencode service (" + $i + "s of 120s)...")
             }
         }
@@ -777,7 +1237,7 @@ function Invoke-Failover {
     param([string]$Reason = 'auto')
     Load-State
     $global:LastFailover = Get-Date
-    $cur = Get-HappCurrentServer
+    $cur = Get-ActiveServer
     if ($cur) {
         Invoke-FailoverReason-Log $Reason $cur
         Mark-Used $cur
@@ -787,65 +1247,102 @@ function Invoke-Failover {
     $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
     Log ("affected sessions: " + (($affected | ForEach-Object { $_.id }) -join ', '))
 
+    # A live desktop app keeps HTTP/SSE connections pinned to the old core.
+    # Stop it before the server changes and start it again once the switch is done.
+    $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
+    if ($Script:Cfg.RestartOpenCode -and $desktopWasRunning) {
+        if (-not (Stop-OpencodeDesktop)) {
+            Log 'opencode desktop could not be stopped - aborting the switch'
+            return
+        }
+    }
+
     $switched = $false
     $rotated = $false
-    for ($attempt = 1; $attempt -le $Script:Cfg.MaxSwitchAttempts -and -not $switched; $attempt++) {
-        Update-ConfigCache | Out-Null
-        $curKey = $null
-        if ($cur) { $curKey = ('{0}:{1}' -f $cur.host, $cur.port) }
-        $candidates = @()
-        foreach ($f in (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
-            $srv = Get-ServerFromCacheKey $f.BaseName
-            if (-not $srv) { continue }
-            $stateKey = ('{0}:{1}' -f $srv.host, $srv.port)
-            if ($Script:State.used.PSObject.Properties[$stateKey]) { continue }
-            if ($curKey -eq $stateKey) { continue }
-            $candidates += $srv
-        }
-        if (-not $candidates) {
-            $cacheCount = (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue).Count
-            $usedCount = ($Script:State.used.PSObject.Properties | Measure-Object).Count
-            if ($cacheCount -gt 0 -and $usedCount -ge $cacheCount -and -not $rotated) {
-                # every cached server was tried - start a new rotation cycle,
-                # keeping only the currently active server marked; remember LRU order
-                $Script:LruOrder = @($Script:State.used.PSObject.Properties | Sort-Object { $_.Value } | ForEach-Object { $_.Name })
-                Log ("all {0} cached servers already used - starting rotation cycle 2 (least-recently-used first)" -f $cacheCount)
-                $curKey2 = $null
-                if ($cur) { $curKey2 = ('{0}:{1}' -f $cur.host, $cur.port) }
-                foreach ($prop in @($Script:State.used.PSObject.Properties)) {
-                    if ($curKey2 -and $prop.Name -eq $curKey2) { continue }
-                    $Script:State.used.PSObject.Properties.Remove($prop.Name) | Out-Null
+    $appReady = $true
+    try {
+        for ($attempt = 1; $attempt -le $Script:Cfg.MaxSwitchAttempts -and -not $switched; $attempt++) {
+            Update-ConfigCache | Out-Null
+            $curKey = $null
+            if ($cur) { $curKey = Get-ServerKey $cur }
+            $cached = @(Get-CachedServerList)
+            $cacheCount = $cached.Count
+            $candidates = @()
+            $unbannedCount = 0
+            $usedUnbannedCount = 0
+            foreach ($srv in $cached) {
+                $stateKey = Get-ServerKey $srv
+                if (-not $stateKey) { continue }
+                if (Test-ServerBanned $stateKey) { continue }
+                $unbannedCount++
+                $isCurrent = ($curKey -eq $stateKey)
+                $isUsed = [bool]$Script:State.used.PSObject.Properties[$stateKey]
+                if ($isUsed) {
+                    if (-not $isCurrent) { $usedUnbannedCount++ }
+                    continue
                 }
-                $rotated = $true
-                Save-State
-                Add-RingEvent ("rotation reset: all {0} cached servers used - cycling again LRU-first" -f $cacheCount)
-                continue
+                if ($isCurrent) { continue }
+                $candidates += $srv
             }
-            if ($cacheCount -eq 0) { Log 'no cached server configs yet - rescanning happens on the next failover attempt' }
-            break
-        }
-        if ($rotated -and $Script:LruOrder) {
-            $candidates = @($candidates | Sort-Object {
-                $k = ('{0}:{1}' -f $_.host, $_.port)
-                $idx = [array]::IndexOf($Script:LruOrder, $k)
-                if ($idx -lt 0) { $idx = [int]::MaxValue }
-                $idx
-            })
-        }
-
-        foreach ($cand in $candidates) {
-            if (Invoke-PipeSwitch -Target $cand) {
-                Mark-Used $cand
-                $switched = $true
+            $bannedCached = $cacheCount - $unbannedCount
+            if ($bannedCached -gt 0) { Log ("skipping {0} banned cached server(s)" -f $bannedCached) }
+            if (-not $candidates) {
+                if ($cacheCount -eq 0) {
+                    Log 'no cached server configs yet - rescanning happens on the next failover attempt'
+                    break
+                }
+                if ($unbannedCount -eq 0) {
+                    Log ("all {0} cached servers are banned - use -UnbanServer (or [L] to inspect)" -f $cacheCount)
+                    break
+                }
+                if ($usedUnbannedCount -gt 0 -and -not $rotated) {
+                    # every unbanned server was tried - reset used (never bans)
+                    Log ("all {0} unbanned cached servers already used - starting rotation cycle 2 (random order; {1} banned)" -f $unbannedCount, @(Get-BannedEntries).Count)
+                    foreach ($prop in @($Script:State.used.PSObject.Properties)) {
+                        if ($curKey -and $prop.Name -eq $curKey) { continue }
+                        $Script:State.used.PSObject.Properties.Remove($prop.Name) | Out-Null
+                    }
+                    $rotated = $true
+                    Save-State
+                    Add-RingEvent ("rotation reset: all {0} unbanned cached servers used - cycling again in random order" -f $unbannedCount)
+                    continue
+                }
+                Log 'no alternative unbanned cached server available'
                 break
-            } else {
-                Mark-Used $cand
+            }
+            $candidates = @(Get-ShuffledItems $candidates)
+            if ($candidates.Count -gt 1) { Log ("choosing randomly from {0} eligible unused servers" -f $candidates.Count) }
+
+            foreach ($cand in $candidates) {
+                if (Invoke-PipeSwitch -Target $cand) {
+                    Mark-Used $cand
+                    $switched = $true
+                    break
+                } else {
+                    Mark-Used $cand
+                }
+            }
+        }
+    } finally {
+        if ($Script:Cfg.RestartOpenCode) {
+            try {
+                if ($desktopWasRunning) {
+                    $appReady = Start-OpencodeDesktop
+                } else {
+                    # no desktop process to relaunch (CLI-only usage) - keep the old behavior
+                    $appReady = Restart-OpencodeService
+                }
+            } catch {
+                Log ("opencode restart failed: " + $_.Exception.Message)
+                $appReady = $false
             }
         }
     }
     if (-not $switched) { Log 'FAILED to switch to any previously unused server'; return }
-
-    if ($Script:Cfg.RestartOpenCode) { Restart-Opencode | Out-Null }
+    if (-not $appReady) {
+        Log 'opencode did not come back - skipping continue prompts'
+        return
+    }
 
     if ($Script:Cfg.ContinueDelaySec -gt 0) {
         Log ("waiting {0}s for the provider to settle before continue prompts..." -f $Script:Cfg.ContinueDelaySec)
@@ -965,12 +1462,14 @@ $Script:AdapterStreak = 0
 $Script:SawTunAlive = $false
 
 function Invoke-FailoverReason-Log([string]$reason, [pscustomobject]$cur) {
+    $label = Format-ServerLabel $cur
     switch ($reason) {
-        'auto' { Log ("rate limit detected; current server {0} ({1}:{2})" -f $cur.name, $cur.host, $cur.port) }
-        'manual' { Log ("manual switch requested; current server {0} ({1}:{2}) marked used" -f $cur.name, $cur.host, $cur.port) }
-        'connreset-burst' { Log ("connection-loss burst (ECONNRESET); current server {0} ({1}:{2}) marked used" -f $cur.name, $cur.host, $cur.port) }
-        'tunnel-dead' { Log ("network unreachable through the tunnel; current server {0} ({1}:{2}) marked used" -f $cur.name, $cur.host, $cur.port) }
-        default { Log ("persistent upstream endpoint errors; switching server (current: {0}:{1})" -f $cur.host, $cur.port) }
+        'auto' { Log ("rate limit detected; current server {0}" -f $label) }
+        'manual' { Log ("manual switch requested; current server {0} marked used" -f $label) }
+        'manual-ban' { Log ("manual ban requested; leaving current server {0} and marking it used" -f $label) }
+        'connreset-burst' { Log ("connection-loss burst (ECONNRESET); current server {0} marked used" -f $label) }
+        'tunnel-dead' { Log ("network unreachable through the tunnel; current server {0} marked used" -f $label) }
+        default { Log ("persistent upstream endpoint errors; switching server (current: {0})" -f $label) }
     }
 }
 
@@ -1008,11 +1507,36 @@ function Handle-Endpoint {
 }
 
 # ------------------------------------------------------------------- test modes
+if ($ListBanned -or $BanServer -or $UnbanServer) {
+    Load-State
+    if ($ListBanned) {
+        $bans = @(Get-BannedEntries)
+        if (-not $bans.Count) {
+            Log 'banned servers: (none)'
+        } else {
+            foreach ($p in $bans) { Log ("banned server: {0} (since {1})" -f $p.Name, $p.Value) }
+        }
+    }
+    if ($BanServer) {
+        $key = Resolve-ServerKey $BanServer
+        if (-not $key) { Log ("invalid server '" + $BanServer + "' - use host:port, host_port, or 'current'") }
+        else { Add-BannedServer $key 'command line' | Out-Null }
+    }
+    if ($UnbanServer) {
+        $key = Resolve-ServerKey $UnbanServer
+        if (-not $key) { Log ("invalid server '" + $UnbanServer + "' - use host:port, host_port, or 'current'") }
+        else { Remove-BannedServer $key | Out-Null }
+    }
+    return
+}
 if ($TestInit) {
     Load-State
     Log ("state: used=[$((($Script:State.used.PSObject.Properties | ForEach-Object { $_.Name })) -join ', ')]")
-    $cur = Get-HappCurrentServer
-    Log ("current: " + ($cur | ConvertTo-Json -Compress -Depth 3))
+    Log ("banned: [$((@(Get-BannedEntries) | ForEach-Object { $_.Name }) -join ', ')]")
+    $active = Get-ActiveServer
+    $reg = Get-HappCurrentServer
+    Log ("active: " + (Format-ServerLabel $active))
+    Log ("registry: " + (Format-ServerLabel $reg))
     $p = Get-DaemonProcess
     Log ("core: " + ($p | ConvertTo-Json -Compress -Depth 4))
     Update-ConfigCache | Out-Null
@@ -1021,18 +1545,22 @@ if ($TestInit) {
 if ($TestSwitch) {
     Load-State
     Update-ConfigCache | Out-Null
-    $cur = Get-HappCurrentServer
+    $cur = Get-ActiveServer
     Mark-Used $cur
-    $cand = $null
-    foreach ($f in (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json')) {
-        $srv = Get-ServerFromCacheKey $f.BaseName
-        if ($cur -and $srv.host -eq $cur.host -and $srv.port -eq $cur.port) { continue }
-        $stateKey = ('{0}:{1}' -f $srv.host, $srv.port)
+    $curKey = $null
+    if ($cur) { $curKey = Get-ServerKey $cur }
+    $candidates = @()
+    foreach ($srv in @(Get-CachedServerList)) {
+        $stateKey = Get-ServerKey $srv
+        if (-not $stateKey) { continue }
+        if (Test-ServerBanned $stateKey) { continue }
+        if ($curKey -eq $stateKey) { continue }
         if ($Script:State.used.PSObject.Properties[$stateKey]) { continue }
-        $cand = $srv; break
+        $candidates += $srv
     }
-    if (-not $cand) { Log 'no unused cached candidate for test switch'; return }
-    Log ("test switch to: " + ($cand | ConvertTo-Json -Compress))
+    if (-not $candidates) { Log 'no unused, unbanned cached candidate for test switch'; return }
+    $cand = @(Get-ShuffledItems $candidates)[0]
+    Log ("test switch to (random pick): " + ($cand | ConvertTo-Json -Compress))
     $res = Invoke-PipeSwitch -Target $cand
     Log ("test switch result: " + $res)
     # the candidate was consumed either way (success or failed attempt)
@@ -1128,17 +1656,37 @@ function Init-ConsoleLayout {
 }
 
 function Get-HeaderLines {
-    $cur = Get-HappCurrentServer
-    $cacheCount = (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue).Count
+    $cur = Get-ActiveServer
+    $cached = @(Get-CachedServerList)
+    $cacheCount = $cached.Count
     $usedCount = 0
     try { $usedCount = ($Script:State.used.PSObject.Properties | Measure-Object).Count } catch { }
-    $nextCandidate = ''
-    foreach ($f in (Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue)) {
-        $k = $f.BaseName
-        if ($k -and $Script:State -and $Script:State.used -and $Script:State.used.PSObject.Properties[$k]) { continue }
-        if ($cur -and $k -eq ('{0}:{1}' -f $cur.host, $cur.port)) { continue }
-        $nextCandidate = $k; break
+    $bannedCount = 0
+    try { $bannedCount = @(Get-BannedEntries).Count } catch { }
+    $curKey = $null
+    if ($cur) { $curKey = Get-ServerKey $cur }
+    $freshCount = 0
+    $unbannedCount = 0
+    $usedUnbannedCount = 0
+    foreach ($srv in $cached) {
+        $k = Get-ServerKey $srv
+        if (-not $k) { continue }
+        if (Test-ServerBanned $k) { continue }
+        $unbannedCount++
+        $isCurrent = ($curKey -eq $k)
+        if ($Script:State.used.PSObject.Properties[$k]) {
+            if (-not $isCurrent) { $usedUnbannedCount++ }
+            continue
+        }
+        if ($isCurrent) { continue }
+        $freshCount++
     }
+    $nextLabel = if ($freshCount -gt 0) { 'random (' + $freshCount + ' eligible)' }
+        elseif ($unbannedCount -eq 0) { '(all banned)' }
+        elseif ($usedUnbannedCount -gt 0) { 'random rotation' }
+        else { '(none)' }
+    $curBanned = $false
+    if ($curKey) { $curBanned = Test-ServerBanned $curKey }
     $guiProc = Get-Process Happ -ErrorAction SilentlyContinue | Select-Object -First 1
     $xrayProc = Get-Process xray -ErrorAction SilentlyContinue | Select-Object -First 1
     $owned = 'no'
@@ -1157,14 +1705,14 @@ function Get-HeaderLines {
     } catch { }
     $tunnel = $(if ($xrayProc) { 'UP' } else { 'DOWN - no xray core' })
     return @(
-        ('OpenCode Happ Watchdog       {0}                                elevated={1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elevated),
+        ('Happ Failover Watchdog        {0}                                elevated={1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elevated),
         ('=============================================================='),
         ('Happ GUI : {0}    xray core: {1}    owned connection: {2}' -f ($(if ($guiProc) { 'running' } else { 'NOT RUNNING' })), ($(if ($xrayProc) { 'running pid ' + $xrayProc.Id } else { 'not running' })), $owned),
-        ('Server   : {0} ({1})' -f $cur.host, $cur.name),
+        ('Server   : {0}{1}' -f (Format-ServerLabel $cur), $(if ($curBanned) { '   [BANNED]' } else { '' })),
         ('Tunnel   : {0}' -f $tunnel),
         ('Exit IP  : {0}    (checked {1})' -f $exitIp, $exitWhen),
-        ('Next     : {0}    cache: {1}    used: {2}    last failover: {3}' -f $(if ($nextCandidate) { $nextCandidate } else { '(none)' }), $cacheCount, $usedCount, $global:LastFailover),
-        ('[T] switch now    [R] rescan+revive    [C] clear used    [Q] quit'),
+        ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    last failover: {4}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $global:LastFailover),
+        ('[T] switch now    [B] ban current    [L] list bans    [R] rescan+revive    [C] clear used    [Q] quit'),
         ('----------------------------------------------------------------')
     )
 }
@@ -1227,8 +1775,15 @@ if ($Watch) {
     Load-State
     $global:LastFailover = Get-Date
     Log 'watchdog starting; tracking current server as used'
-    $cur = Get-HappCurrentServer
-    if ($cur) { Mark-Used $cur }
+    $cur = Get-ActiveServer
+    if ($cur) {
+        Mark-Used $cur
+        if (Test-ServerBanned (Get-ServerKey $cur)) {
+            Log ('WARNING: current server ' + (Format-ServerLabel $cur) + ' is banned - the next switch will leave it')
+        }
+    }
+    $startupBans = @(Get-BannedEntries).Count
+    if ($startupBans -gt 0) { Log ("banned server list loaded: " + $startupBans) }
     $mutex = New-Object System.Threading.Mutex($false, 'happ-failover-watchdog')
     if (-not $mutex.WaitOne(50, $false)) { Log 'another instance running - exiting'; return }
     Log 'watchdog active'
@@ -1254,9 +1809,10 @@ if ($Watch) {
         }
     }
     if ($Interactive -and $Script:LayoutReady) { Render-Frame }
-    try { $host.UI.RawUI.WindowTitle = 'OpenCode Happ Watchdog' } catch { }
+    try { $host.UI.RawUI.WindowTitle = 'Happ Failover Watchdog' } catch { }
     while ($true) {
         try {
+            Load-Bans
             $fails = Test-OpLogTail
             $now = Get-Date
             # rate limits take priority: full server failover
@@ -1357,6 +1913,25 @@ if ($Watch) {
                         $key = [Console]::ReadKey($true)
                         switch ($key.Key) {
                             'T' { Log 'manual switch requested [T]'; Invoke-Failover -Reason 'manual' | Out-Null }
+                            'B' {
+                                $curB = Get-ActiveServer
+                                if (-not $curB) {
+                                    Log 'cannot determine the active server - use -BanServer host:port instead'
+                                    break
+                                }
+                                $bKey = Get-ServerKey $curB
+                                Add-BannedServer $bKey 'hotkey B' | Out-Null
+                                Log ("switching away from banned server " + $bKey + "...")
+                                Invoke-Failover -Reason 'manual-ban' | Out-Null
+                            }
+                            'L' {
+                                $bans = @(Get-BannedEntries)
+                                if (-not $bans.Count) {
+                                    Log 'banned servers: (none)'
+                                } else {
+                                    foreach ($p in $bans) { Log ("banned server: {0} (since {1})" -f $p.Name, $p.Value) }
+                                }
+                            }
                             'R' {
                                 Log 'config cache rescan requested [R]'
                                 Update-ConfigCache | Out-Null
@@ -1377,7 +1952,7 @@ if ($Watch) {
                                 }
                             }
                             'C' {
-                                Log 'used-server list cleared [C] - all cached servers are candidates again'
+                                Log 'used-server list cleared [C] - all non-banned cached servers are candidates again (bans unchanged)'
                                 $Script:State | Add-Member -NotePropertyName used -NotePropertyValue (New-Object PSObject) -Force
                                 Save-State
                             }
@@ -1401,4 +1976,4 @@ if ($Watch) {
     }
 }
 
-Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch"
+Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -ListBanned / -BanServer host:port / -UnbanServer host:port"
