@@ -114,7 +114,11 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListBanned
 ```
 
 In the interactive dashboard, `B` bans the server currently in use and immediately
-switches away from it; `L` prints the banned list to the event log.
+switches away from it. `L` opens the bans/server editor: every known cached, active,
+used, or banned server is listed with its cached name, banned entries first and in red.
+Use `Up`/`Down` (plus `PgUp`/`PgDn`, `Home`/`End`) to move and press `Enter` to
+ban/unban the selected server. `Esc` or `L` closes the editor. The selection follows the
+server if toggling moves it between the banned and unbanned groups.
 
 ### Active server tracking
 
@@ -173,7 +177,7 @@ rolling event log.
 | --- | --- |
 | `T` | switch to a random unused, unbanned server now (same flow as automatic failover) |
 | `B` | ban the current server and switch away from it immediately |
-| `L` | print the banned-server list to the event log |
+| `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `Esc`/`L` closes) |
 | `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure |
 | `C` | clear the used-server list; bans are unchanged |
 | `Q` | quit (releases the owned core and tunnel; reconnect via the Happ GUI) |

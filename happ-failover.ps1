@@ -66,6 +66,8 @@ $Script:Cfg = @{
     RestartOpenCode   = $true
     TopLevelOnly      = $true
     MaxSwitchAttempts = 6
+    FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
+    ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
     TunExe             = 'C:\Program Files\FlyFrogLLC\Happ\tun\sing-box.exe'
     TunConfigPath      = (Join-Path $env:LOCALAPPDATA 'Happ\config.json')
     TunIface           = 'happ-tun'
@@ -102,6 +104,7 @@ $Script:EventRing = New-Object System.Collections.Generic.List[string]
 $Script:RingCap = 400
 $Script:LastWinW = -1
 $Script:LastWinH = -1
+$Script:BansEditor = $null
 
 function Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
@@ -116,7 +119,7 @@ function Log([string]$msg) {
 # ------------------------------------------------------------------- state
 function Initialize-StateMaps {
     $changed = $false
-    foreach ($name in @('used','prompted')) {
+    foreach ($name in @('used','prompted','reliability')) {
         $prop = $Script:State.PSObject.Properties[$name]
         if (-not $prop -or $null -eq $prop.Value) {
             Add-Member -InputObject $Script:State -NotePropertyName $name -NotePropertyValue (New-Object PSObject) -Force
@@ -708,6 +711,118 @@ function Get-ShuffledItems {
     return $arr
 }
 
+# ------------------------------------------------------------------- reliability
+# Per-server switch history so that server choice gets smarter over time:
+#  - every switch is verified by an exit-IP test; success/failure and the exit IP are
+#    recorded per server ('SWITCH OK' -> ok=true + exit IP; 'exit check failed' -> fail)
+#  - a server that just failed verify is demoted for FailSkipMin minutes (it costs a
+#    full attempt slot: pipe burst + verify retries + revert),
+#  - a server whose last observed exit IP was seen within ExitIpFreshMin is demoted:
+#    OpenCode's free-model quota is per public exit IP, so a recently exited IP is a
+#    wall the switch would land on; servers never switched to carry no record and
+#    stay fully preferred.
+function Get-ReliabilityRecord([string]$key) {
+    if (-not $key) { return $null }
+    $rel = $Script:State.reliability
+    if (-not $rel) { return $null }
+    $p = $rel.PSObject.Properties[$key]
+    if ($p) { return $p.Value }
+    return $null
+}
+function Update-Reliability([string]$key, [bool]$ok, [string]$exitIp = '') {
+    if (-not $key) { return }
+    $rel = $Script:State.reliability
+    if (-not $rel) {
+        $rel = New-Object PSObject
+        Add-Member -InputObject $Script:State -NotePropertyName reliability -NotePropertyValue $rel -Force
+    }
+    $rec = Get-ReliabilityRecord $key
+    if (-not $rec) {
+        $rec = New-Object PSObject
+        Add-Member -InputObject $rel -NotePropertyName $key -NotePropertyValue $rec -Force
+    }
+    $now = Get-Date -Format 'o'
+    if ($ok) {
+        Add-Member -InputObject $rec -NotePropertyName lastOk -NotePropertyValue $now -Force
+        Add-Member -InputObject $rec -NotePropertyName lastFail -NotePropertyValue '' -Force
+        $okCount = 0
+        try { $okCount = [int]$rec.okCount } catch { }
+        Add-Member -InputObject $rec -NotePropertyName okCount -NotePropertyValue ($okCount + 1) -Force
+        Add-Member -InputObject $rec -NotePropertyName failStreak -NotePropertyValue 0 -Force
+    } else {
+        Add-Member -InputObject $rec -NotePropertyName lastFail -NotePropertyValue $now -Force
+        $failCount = 0
+        try { $failCount = [int]$rec.failCount } catch { }
+        $failStreak = 0
+        try { $failStreak = [int]$rec.failStreak } catch { }
+        Add-Member -InputObject $rec -NotePropertyName failCount -NotePropertyValue ($failCount + 1) -Force
+        Add-Member -InputObject $rec -NotePropertyName failStreak -NotePropertyValue ($failStreak + 1) -Force
+    }
+    if ($exitIp) {
+        Add-Member -InputObject $rec -NotePropertyName lastExitIp -NotePropertyValue ([string]$exitIp) -Force
+        Add-Member -InputObject $rec -NotePropertyName lastExitAt -NotePropertyValue $now -Force
+    }
+    Save-State
+}
+function Test-RecentFail([string]$key) {
+    $rec = Get-ReliabilityRecord $key
+    if (-not $rec -or -not $rec.lastFail) { return $false }
+    try {
+        # parse into [datetime] - subtracting DateTimeOffset from DateTime throws
+        $t = [datetime]::Parse([string]$rec.lastFail)
+        if (((Get-Date) - $t).TotalMinutes -lt $Script:Cfg.FailSkipMin) { return $true }
+    } catch { }
+    return $false
+}
+function Get-RecentExitIpSet {
+    # exit IPs observed (on any server) within the freshness window - candidates whose
+    # own last exit IP is in this set would land on a burdened IP again
+    $set = @{}
+    $rel = $Script:State.reliability
+    if (-not $rel) { return $set }
+    foreach ($p in $rel.PSObject.Properties) {
+        $ip = $p.Value.lastExitIp
+        $at = $p.Value.lastExitAt
+        if (-not $ip -or -not $at) { continue }
+        try {
+            $t = [datetime]::Parse([string]$at)
+            if (((Get-Date) - $t).TotalMinutes -lt $Script:Cfg.ExitIpFreshMin) { $set[[string]$ip] = $true }
+        } catch { }
+    }
+    return $set
+}
+function Optimize-CandidateOrder {
+    # Re-order switch candidates: preferred servers first (shuffled, so distribution
+    # stays even inside the preferred group), demoted ones last (still reachable when
+    # nothing stronger exists; the attempt loop walks the list top-down until a
+    # switch verifies). Never empties the list - the rotation-cycle-2 reset stays
+    # triggered only by true exhaustion of the unused pool.
+    param([object[]]$Candidates)
+    $result = [pscustomobject]@{
+        ordered     = @()
+        preferred   = 0
+        recentFail  = 0
+        staleExitIp = 0
+        bogusHost   = 0
+    }
+    $pref = @()
+    $fall = @()
+    $recentIps = Get-RecentExitIpSet
+    foreach ($srv in $Candidates) {
+        $key = Get-ServerKey $srv
+        if (-not $key) { continue }
+        if (([string]$srv.host -eq '0.0.0.0') -or ([string]$srv.host -match '^127\.')) { $result.bogusHost++; $fall += $srv; continue }
+        if (Test-RecentFail $key) { $result.recentFail++; $fall += $srv; continue }
+        $rec = Get-ReliabilityRecord $key
+        if ($rec -and $rec.lastExitIp -and $recentIps.ContainsKey([string]$rec.lastExitIp)) { $result.staleExitIp++; $fall += $srv; continue }
+        $pref += $srv
+    }
+    $result.preferred = $pref.Count
+    foreach ($s in @(Get-ShuffledItems $pref)) { $result.ordered = @($result.ordered) + $s }
+    foreach ($s in @(Get-ShuffledItems $fall)) { $result.ordered = @($result.ordered) + $s }
+    return $result
+}
+
 function Get-CachedOutbound {
     param([string]$srvHost, [int]$srvPort)
     $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort)
@@ -931,7 +1046,11 @@ function Invoke-PipeSwitch {
     $curBanned = $false
     if ($curSrv) { $curBanned = Test-ServerBanned (Get-ServerKey $curSrv) }
     $newOut = Get-CachedOutbound -srvHost $Target.host -srvPort $Target.port
-    if (-not $newOut) { Log ("no cached outbound for {0}:{1}" -f $Target.host, $Target.port); return $false }
+    if (-not $newOut) {
+        Log ("no cached outbound for {0}:{1}" -f $Target.host, $Target.port)
+        Update-Reliability (Get-ServerKey $Target) $false
+        return $false
+    }
 
     $newCfg = Build-Config -Template $template -NewOutbound $newOut
     $newJson = ConvertTo-Json -InputObject $newCfg -Compress -Depth 30
@@ -948,7 +1067,11 @@ function Invoke-PipeSwitch {
     $alive = Get-Process xray -ErrorAction SilentlyContinue
     if ($alive) {
         Log ('GUI-owned core still running - OS-level kill')
-        if (-not (Invoke-KillCore)) { Log 'could not kill the running core'; return $false }
+        if (-not (Invoke-KillCore)) {
+            Log 'could not kill the running core'
+            Update-Reliability (Get-ServerKey $Target) $false
+            return $false
+        }
     }
     # 2. start with the new config; keep the owner connection open
     $Script:OwnedBurst = Start-CoreBurst -configJson $newJson
@@ -965,9 +1088,11 @@ function Invoke-PipeSwitch {
     $plainIp = Get-PlainRouteIp
     if ($exitIpAfter) {
         Log ("SWITCH OK -> {0}:{1} (core exit IP: {2}{3}; system route: {4})" -f $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
+        Update-Reliability (Get-ServerKey $Target) $true $exitIpAfter
         Set-ActiveServer $Target
         return $true
     }
+    Update-Reliability (Get-ServerKey $Target) $false
     Log 'exit check failed on the new server - reverting to original config'
     if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
     $Script:OwnedClient = $null; $Script:OwnedBurst = $null
@@ -1310,8 +1435,11 @@ function Invoke-Failover {
                 Log 'no alternative unbanned cached server available'
                 break
             }
-            $candidates = @(Get-ShuffledItems $candidates)
-            if ($candidates.Count -gt 1) { Log ("choosing randomly from {0} eligible unused servers" -f $candidates.Count) }
+            $opt = Optimize-CandidateOrder -Candidates $candidates
+            $candidates = @($opt.ordered)
+            if ($candidates.Count -gt 1 -or $opt.recentFail -or $opt.staleExitIp -or $opt.bogusHost) {
+                Log ("server choice: {0} preferred + {1} fallback (recent-fail: {2}, stale exit IP: {3}, bogus host: {4})" -f $opt.preferred, ($opt.recentFail + $opt.staleExitIp + $opt.bogusHost), $opt.recentFail, $opt.staleExitIp, $opt.bogusHost)
+            }
 
             foreach ($cand in $candidates) {
                 if (Invoke-PipeSwitch -Target $cand) {
@@ -1559,8 +1687,10 @@ if ($TestSwitch) {
         $candidates += $srv
     }
     if (-not $candidates) { Log 'no unused, unbanned cached candidate for test switch'; return }
-    $cand = @(Get-ShuffledItems $candidates)[0]
-    Log ("test switch to (random pick): " + ($cand | ConvertTo-Json -Compress))
+    $opt = Optimize-CandidateOrder -Candidates $candidates
+    Log ("test candidates: {0} preferred (recent-fail {1}, stale exit IP {2}, bogus host {3})" -f $opt.preferred, $opt.recentFail, $opt.staleExitIp, $opt.bogusHost)
+    $cand = @($opt.ordered)[0]
+    Log ("test switch to (quality pick): " + ($cand | ConvertTo-Json -Compress))
     $res = Invoke-PipeSwitch -Target $cand
     Log ("test switch result: " + $res)
     # the candidate was consumed either way (success or failed attempt)
@@ -1668,6 +1798,7 @@ function Get-HeaderLines {
     $freshCount = 0
     $unbannedCount = 0
     $usedUnbannedCount = 0
+    $freshList = @()
     foreach ($srv in $cached) {
         $k = Get-ServerKey $srv
         if (-not $k) { continue }
@@ -1680,11 +1811,23 @@ function Get-HeaderLines {
         }
         if ($isCurrent) { continue }
         $freshCount++
+        $freshList += $srv
     }
-    $nextLabel = if ($freshCount -gt 0) { 'random (' + $freshCount + ' eligible)' }
-        elseif ($unbannedCount -eq 0) { '(all banned)' }
-        elseif ($usedUnbannedCount -gt 0) { 'random rotation' }
-        else { '(none)' }
+    $nextLabel = ''
+    try {
+        $opt = $null
+        if ($freshCount -gt 0) { $opt = Optimize-CandidateOrder -Candidates $freshList }
+        if ($opt -and $opt.preferred -gt 0) {
+            $nextLabel = ('quality ({0} pref + {1} fallback)' -f $opt.preferred, ($opt.recentFail + $opt.staleExitIp + $opt.bogusHost))
+        } elseif ($opt) {
+            # every unused candidate is demoted right now (recent fails / stale exit IPs)
+            $nextLabel = 'random rotation'
+        } elseif ($unbannedCount -eq 0) { $nextLabel = '(all banned)' }
+        elseif ($usedUnbannedCount -gt 0) { $nextLabel = 'random rotation' }
+        else { $nextLabel = '(none)' }
+    } catch {
+        if ($freshCount -gt 0) { $nextLabel = 'random (' + $freshCount + ' eligible)' } else { $nextLabel = 'random rotation' }
+    }
     $curBanned = $false
     if ($curKey) { $curBanned = Test-ServerBanned $curKey }
     $guiProc = Get-Process Happ -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -1712,12 +1855,292 @@ function Get-HeaderLines {
         ('Tunnel   : {0}' -f $tunnel),
         ('Exit IP  : {0}    (checked {1})' -f $exitIp, $exitWhen),
         ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    last failover: {4}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $global:LastFailover),
-        ('[T] switch now    [B] ban current    [L] list bans    [R] rescan+revive    [C] clear used    [Q] quit'),
+        ('[T] switch now    [B] ban current    [L] bans editor    [R] rescan+revive    [C] clear used    [Q] quit'),
         ('----------------------------------------------------------------')
     )
 }
 
+# ------------------------------------------------------------------- bans editor
+# The editor works on the union of cached servers, the active server, and any
+# server still present in used/reliability/bans state. That way a ban can always
+# be found and removed even if its cache config has disappeared.
+function Get-ServerFromKey([string]$key) {
+    if (-not $key) { return $null }
+    $i = $key.LastIndexOf(':')
+    if ($i -lt 1) { return $null }
+    $port = 0
+    if (-not [int]::TryParse($key.Substring($i + 1), [ref]$port)) { return $null }
+    if ($port -lt 1 -or $port -gt 65535) { return $null }
+    return [pscustomobject]@{ host = $key.Substring(0, $i); port = $port }
+}
+
+function Get-AllKnownServers {
+    if (-not $Script:State) { Load-State }
+    $map = @{}
+    foreach ($srv in @(Get-CachedServerList)) {
+        $key = Get-ServerKey $srv
+        if (-not $key -or $map.ContainsKey($key)) { continue }
+        $name = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port))).Trim()
+        $map[$key] = [pscustomobject]@{
+            host = [string]$srv.host
+            port = [int]$srv.port
+            key  = $key
+            name = $name
+        }
+    }
+
+    $active = Get-ActiveServer
+    if ($active) {
+        $aKey = Get-ServerKey $active
+        if ($aKey) {
+            $aName = ([string]$active.name).Trim()
+            if ($map.ContainsKey($aKey)) {
+                if (-not $map[$aKey].name -and $aName) { $map[$aKey].name = $aName }
+            } else {
+                if (-not $aName) { $aName = ([string](Get-CachedServerName ([string]$active.host) ([int]$active.port))).Trim() }
+                $map[$aKey] = [pscustomobject]@{
+                    host = [string]$active.host
+                    port = [int]$active.port
+                    key  = $aKey
+                    name = $aName
+                }
+            }
+        }
+    }
+
+    $addKey = {
+        param([string]$key)
+        if (-not $key -or $map.ContainsKey($key)) { return }
+        $srv = Get-ServerFromKey $key
+        if (-not $srv) { return }
+        $name = ([string](Get-CachedServerName $srv.host $srv.port)).Trim()
+        $map[$key] = [pscustomobject]@{
+            host = $srv.host
+            port = [int]$srv.port
+            key  = $key
+            name = $name
+        }
+    }
+    foreach ($ban in @(Get-BannedEntries)) { & $addKey ([string]$ban.Name) }
+    try { foreach ($prop in @($Script:State.used.PSObject.Properties)) { & $addKey ([string]$prop.Name) } } catch { }
+    try {
+        $rel = $Script:State.reliability
+        if ($rel) { foreach ($prop in @($rel.PSObject.Properties)) { & $addKey ([string]$prop.Name) } }
+    } catch { }
+
+    $curKey = $null
+    if ($active) { $curKey = Get-ServerKey $active }
+    $rows = foreach ($srv in $map.Values) {
+        $banned = Test-ServerBanned $srv.key
+        $used = $false
+        try { $used = [bool]$Script:State.used.PSObject.Properties[$srv.key] } catch { }
+        [pscustomobject]@{
+            host       = $srv.host
+            port       = $srv.port
+            key        = $srv.key
+            name       = $srv.name
+            banned     = $banned
+            current    = ($srv.key -eq $curKey)
+            used       = $used
+            sortBanned = $(if ($banned) { 0 } else { 1 })
+            sortName   = $(if ($srv.name) { $srv.name.ToLowerInvariant() } else { $srv.key.ToLowerInvariant() })
+        }
+    }
+    return @($rows | Sort-Object sortBanned, sortName, key)
+}
+
+function Refresh-BansEditor {
+    if (-not $Script:BansEditor) { return }
+    $selectedKey = $null
+    try {
+        $old = @($Script:BansEditor.Items)
+        if ($old.Count -gt 0 -and $Script:BansEditor.Index -ge 0 -and $Script:BansEditor.Index -lt $old.Count) {
+            $selectedKey = [string]$old[$Script:BansEditor.Index].key
+        }
+    } catch { }
+    $items = @(Get-AllKnownServers)
+    $idx = 0
+    if ($selectedKey) {
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            if ([string]$items[$i].key -eq $selectedKey) { $idx = $i; break }
+        }
+    }
+    if ($items.Count -eq 0) { $idx = 0 }
+    elseif ($idx -ge $items.Count) { $idx = $items.Count - 1 }
+    $Script:BansEditor.Items = $items
+    $Script:BansEditor.Index = $idx
+    if ($Script:BansEditor.Offset -gt $idx) { $Script:BansEditor.Offset = $idx }
+    if ($Script:BansEditor.Offset -lt 0) { $Script:BansEditor.Offset = 0 }
+}
+
+function Open-BansEditor {
+    Load-Bans
+    $Script:BansEditor = [pscustomobject]@{
+        Active = $true
+        Items  = @()
+        Index  = 0
+        Offset = 0
+    }
+    Refresh-BansEditor
+}
+
+function Close-BansEditor {
+    $Script:BansEditor = $null
+}
+
+function Move-BansEditorSelection([int]$delta) {
+    if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
+    $items = @($Script:BansEditor.Items)
+    if (-not $items.Count) { return }
+    $next = [int]$Script:BansEditor.Index + $delta
+    if ($next -lt 0) { $next = 0 }
+    if ($next -ge $items.Count) { $next = $items.Count - 1 }
+    $Script:BansEditor.Index = $next
+}
+
+function Toggle-BansEditorSelection {
+    if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
+    $items = @($Script:BansEditor.Items)
+    if (-not $items.Count) { return }
+    $idx = [Math]::Max(0, [Math]::Min([int]$Script:BansEditor.Index, $items.Count - 1))
+    $item = $items[$idx]
+    if ($item.banned) {
+        Remove-BannedServer $item.key | Out-Null
+    } else {
+        Add-BannedServer $item.key 'bans editor' | Out-Null
+    }
+    Refresh-BansEditor
+}
+
+function Render-BansEditor {
+    if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
+    if (-not $Script:LayoutReady) { return }
+    try {
+        $w = [Console]::WindowWidth
+        $h = [Console]::WindowHeight
+        if ($w -ne $Script:LastWinW -or $h -ne $Script:LastWinH) {
+            try { [Console]::SetBufferSize($w, $h) } catch { }
+            $Script:LastWinW = $w
+            $Script:LastWinH = $h
+        }
+
+        $items = @($Script:BansEditor.Items)
+        $count = $items.Count
+        $idx = [int]$Script:BansEditor.Index
+        if ($count -eq 0) { $idx = 0 }
+        elseif ($idx -lt 0) { $idx = 0 }
+        elseif ($idx -ge $count) { $idx = $count - 1 }
+        $Script:BansEditor.Index = $idx
+        $bannedCount = 0
+        foreach ($it in $items) { if ($it.banned) { $bannedCount++ } }
+
+        $hdrRows = 3
+        $ftrRows = 1
+        $view = [Math]::Max(1, $h - $hdrRows - $ftrRows)
+        $offset = [int]$Script:BansEditor.Offset
+        if ($idx -lt $offset) { $offset = $idx }
+        if ($idx -ge ($offset + $view)) { $offset = $idx - $view + 1 }
+        $maxOffset = [Math]::Max(0, $count - $view)
+        if ($offset -gt $maxOffset) { $offset = $maxOffset }
+        if ($offset -lt 0) { $offset = 0 }
+        $Script:BansEditor.Offset = $offset
+        $first = $(if ($count -gt 0) { $offset + 1 } else { 0 })
+        $last = [Math]::Min($count, $offset + $view)
+
+        $rows = New-Object System.Collections.Generic.List[object]
+        $rows.Add([pscustomobject]@{
+            Text = ('BANS / SERVERS   total {0}   banned {1}   showing {2}-{3}   [Up/Down] move   [Enter] toggle   [Esc/L] close' -f $count, $bannedCount, $first, $last)
+            Fg   = [ConsoleColor]::Cyan
+            Bg   = [ConsoleColor]::Black
+        })
+        $rows.Add([pscustomobject]@{
+            Text = ('=' * [Math]::Max(1, $w))
+            Fg   = [ConsoleColor]::DarkGray
+            Bg   = [ConsoleColor]::Black
+        })
+        $rows.Add([pscustomobject]@{
+            Text = '  STATE     CUR NAME                              HOST:PORT                 USED'
+            Fg   = [ConsoleColor]::DarkGray
+            Bg   = [ConsoleColor]::Black
+        })
+
+        for ($i = $offset; $i -lt $last; $i++) {
+            $item = $items[$i]
+            $selected = ($i -eq $idx)
+            $status = $(if ($item.banned) { '[BANNED]' } else { '[  ok  ]' })
+            $selMark = $(if ($selected) { '>' } else { ' ' })
+            $curMark = $(if ($item.current) { '*' } else { ' ' })
+            $usedMark = $(if ($item.used) { 'used' } else { '    ' })
+            $name = [string]$item.name
+            if (-not $name) { $name = '(unnamed)' }
+            $prefix = ('{0} {1} {2} ' -f $selMark, $status, $curMark)
+            $suffix = ('  {0}  {1}' -f $item.key, $usedMark)
+            $avail = [Math]::Max(8, $w - $prefix.Length - $suffix.Length)
+            if ($name.Length -gt $avail) {
+                if ($avail -le 3) { $name = $name.Substring(0, $avail) }
+                else { $name = $name.Substring(0, $avail - 3) + '...' }
+            }
+            $text = $prefix + $name.PadRight($avail) + $suffix
+            if ($selected -and $item.banned) {
+                $fg = [ConsoleColor]::White; $bg = [ConsoleColor]::DarkRed
+            } elseif ($selected) {
+                $fg = [ConsoleColor]::Black; $bg = [ConsoleColor]::Cyan
+            } elseif ($item.banned) {
+                $fg = [ConsoleColor]::Red; $bg = [ConsoleColor]::Black
+            } elseif ($item.current) {
+                $fg = [ConsoleColor]::Yellow; $bg = [ConsoleColor]::Black
+            } else {
+                $fg = [ConsoleColor]::Gray; $bg = [ConsoleColor]::Black
+            }
+            $rows.Add([pscustomobject]@{ Text = $text; Fg = $fg; Bg = $bg })
+        }
+        if ($count -eq 0) {
+            $rows.Add([pscustomobject]@{
+                Text = '  (no known servers - press R to rescan the cache)'
+                Fg   = [ConsoleColor]::Yellow
+                Bg   = [ConsoleColor]::Black
+            })
+        }
+        while ($rows.Count -lt ($h - 1)) {
+            $rows.Add([pscustomobject]@{ Text = ''; Fg = [ConsoleColor]::Gray; Bg = [ConsoleColor]::Black })
+        }
+
+        $footer = 'No server selected'
+        if ($count -gt 0) {
+            $sel = $items[$idx]
+            $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
+            $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
+            $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   Esc/L close' -f $label, $sel.key, $action)
+        }
+        $rows.Add([pscustomobject]@{ Text = $footer; Fg = [ConsoleColor]::Cyan; Bg = [ConsoleColor]::Black })
+
+        for ($row = 0; $row -lt $h; $row++) {
+            $r = $null
+            if ($row -lt $rows.Count) { $r = $rows[$row] }
+            if ($r) { $txt = [string]$r.Text; $fg = $r.Fg; $bg = $r.Bg }
+            else { $txt = ''; $fg = [ConsoleColor]::Gray; $bg = [ConsoleColor]::Black }
+            if ($txt.Length -gt $w) { $txt = $txt.Substring(0, $w) } else { $txt = $txt.PadRight($w) }
+            [Console]::SetCursorPosition(0, $row)
+            try { [Console]::ForegroundColor = $fg; [Console]::BackgroundColor = $bg } catch { }
+            [Console]::Write($txt)
+        }
+        [Console]::ResetColor()
+        [Console]::SetCursorPosition(0, [Math]::Max(0, $h - 1))
+    } catch {
+        try {
+            $pos = ''
+            try { if ($_.InvocationInfo) { $pos = ' at ' + (Split-Path -Leaf $_.InvocationInfo.ScriptName) + ':' + $_.InvocationInfo.ScriptLineNumber } } catch { }
+            ('[bans-editor] ' + $_.Exception.GetType().Name + ': ' + $_.Exception.Message + $pos) | Out-File $Script:Cfg.LogPath -Append -Encoding utf8
+        } catch { }
+        $Script:LayoutReady = $false
+    }
+}
+
 function Render-Frame {
+    if ($Script:BansEditor -and $Script:BansEditor.Active) {
+        Render-BansEditor
+        return
+    }
     if (-not $Script:LayoutReady) { return }
     try {
         $w = [Console]::WindowWidth
@@ -1911,6 +2334,22 @@ if ($Watch) {
                     try { $hit = [Console]::KeyAvailable } catch { }
                     if ($hit) {
                         $key = [Console]::ReadKey($true)
+                        if ($Script:BansEditor -and $Script:BansEditor.Active) {
+                            switch ($key.Key) {
+                                'UpArrow' { Move-BansEditorSelection -delta -1 }
+                                'DownArrow' { Move-BansEditorSelection -delta 1 }
+                                'PageUp' { Move-BansEditorSelection -delta -10 }
+                                'PageDown' { Move-BansEditorSelection -delta 10 }
+                                'Home' { Move-BansEditorSelection -delta -9999 }
+                                'End' { Move-BansEditorSelection -delta 9999 }
+                                'Enter' { Toggle-BansEditorSelection }
+                                'Escape' { Close-BansEditor }
+                                'L' { Close-BansEditor }
+                                'Q' { Close-BansEditor }
+                            }
+                            if ($Script:LayoutReady) { Render-Frame }
+                            continue
+                        }
                         switch ($key.Key) {
                             'T' { Log 'manual switch requested [T]'; Invoke-Failover -Reason 'manual' | Out-Null }
                             'B' {
@@ -1925,12 +2364,7 @@ if ($Watch) {
                                 Invoke-Failover -Reason 'manual-ban' | Out-Null
                             }
                             'L' {
-                                $bans = @(Get-BannedEntries)
-                                if (-not $bans.Count) {
-                                    Log 'banned servers: (none)'
-                                } else {
-                                    foreach ($p in $bans) { Log ("banned server: {0} (since {1})" -f $p.Name, $p.Value) }
-                                }
+                                Open-BansEditor
                             }
                             'R' {
                                 Log 'config cache rescan requested [R]'
