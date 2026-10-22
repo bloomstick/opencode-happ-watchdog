@@ -117,8 +117,11 @@ In the interactive dashboard, `B` bans the server currently in use and immediate
 switches away from it. `L` opens the bans/server editor: every known cached, active,
 used, or banned server is listed with its cached name, banned entries first and in red.
 Use `Up`/`Down` (plus `PgUp`/`PgDn`, `Home`/`End`) to move and press `Enter` to
-ban/unban the selected server. `Esc` or `L` closes the editor. The selection follows the
-server if toggling moves it between the banned and unbanned groups.
+ban/unban the selected server. `R` rescans the cache, and `Esc` or `L` closes the
+editor. The selection follows the server if toggling moves it between the banned and
+unbanned groups. The editor runs as a fast modal loop (25 ms input polling) so movement
+stays responsive; automatic watchdog polling pauses while it is open and resumes on
+close (the daemon heartbeat continues).
 
 ### Active server tracking
 
@@ -171,13 +174,14 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -Watch -Interactive
 
 The dashboard shows live status: Happ GUI/core state, the active server, the number of
 eligible servers for the next random pick, cache/used/banned stats, last failover, and a
-rolling event log.
+rolling event log. Window resizes are debounced: the watchdog waits for the drag to
+settle, re-applies the pinned buffer at the top-left, then redraws.
 
 | key | action |
 | --- | --- |
 | `T` | switch to a random unused, unbanned server now (same flow as automatic failover) |
 | `B` | ban the current server and switch away from it immediately |
-| `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `Esc`/`L` closes) |
+| `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `R` rescans, `Esc`/`L` closes) |
 | `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure |
 | `C` | clear the used-server list; bans are unchanged |
 | `Q` | quit (releases the owned core and tunnel; reconnect via the Happ GUI) |

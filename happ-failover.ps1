@@ -104,7 +104,11 @@ $Script:EventRing = New-Object System.Collections.Generic.List[string]
 $Script:RingCap = 400
 $Script:LastWinW = -1
 $Script:LastWinH = -1
+$Script:PendingWinW = -1
+$Script:PendingWinH = -1
+$Script:PendingWinAt = $null
 $Script:BansEditor = $null
+$Script:SuppressRender = $false
 
 function Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
@@ -1774,15 +1778,64 @@ public class ConUtil {
 # in-memory ring, so window resizes and log volume can never scroll the
 # header away and no full-screen clears are needed
 
+function Sync-ConsoleSize {
+    # Debounce window resizes: while the user drags the edge, Windows reports
+    # changing dimensions and can reflow/scroll the buffer. Wait for a stable
+    # size, then re-apply the pinned buffer and redraw from a clean top-left.
+    try {
+        $w = [int][Console]::WindowWidth
+        $h = [int][Console]::WindowHeight
+    } catch { return $false }
+    if ($w -lt 20 -or $h -lt 5) { return $false }
+
+    $first = ($Script:LastWinW -lt 0 -or $Script:LastWinH -lt 0)
+    if ((-not $first) -and $w -eq $Script:LastWinW -and $h -eq $Script:LastWinH) {
+        $Script:PendingWinW = -1
+        $Script:PendingWinH = -1
+        $Script:PendingWinAt = $null
+        return $true
+    }
+
+    $now = Get-Date
+    if ($w -ne $Script:PendingWinW -or $h -ne $Script:PendingWinH) {
+        $Script:PendingWinW = $w
+        $Script:PendingWinH = $h
+        $Script:PendingWinAt = $now
+        if (-not $first) { return $false }
+    }
+    if (-not $first -and $Script:PendingWinAt -and
+        (($now - $Script:PendingWinAt).TotalMilliseconds -lt 180)) {
+        return $false
+    }
+
+    try { [Console]::SetWindowPosition(0, 0) } catch { }
+    try { [Console]::SetBufferSize($w, $h) } catch { }
+    try { [Console]::SetWindowPosition(0, 0) } catch { }
+    $Script:LastWinW = $w
+    $Script:LastWinH = $h
+    $Script:PendingWinW = -1
+    $Script:PendingWinH = -1
+    $Script:PendingWinAt = $null
+    return $true
+}
+
 function Init-ConsoleLayout {
     if (-not $Interactive) { return }
     try {
-        if ([Console]::WindowHeight -lt 14 -or [Console]::WindowWidth -lt 40) { return }
+        if ([Console]::WindowHeight -lt 14 -or [Console]::WindowWidth -lt 40) {
+            $Script:LayoutReady = $false
+            return
+        }
+        $Script:LastWinW = -1
+        $Script:LastWinH = -1
+        $Script:PendingWinW = -1
+        $Script:PendingWinH = -1
+        $Script:PendingWinAt = $null
         $Script:LayoutReady = $true
-        $Script:LastWinW = [Console]::WindowWidth
-        $Script:LastWinH = [Console]::WindowHeight
-        try { [Console]::SetBufferSize($Script:LastWinW, $Script:LastWinH) } catch { }
-    } catch { }
+        $null = Sync-ConsoleSize
+    } catch {
+        $Script:LayoutReady = $false
+    }
 }
 
 function Get-HeaderLines {
@@ -1958,7 +2011,13 @@ function Refresh-BansEditor {
             $selectedKey = [string]$old[$Script:BansEditor.Index].key
         }
     } catch { }
-    $items = @(Get-AllKnownServers)
+    $oldSuppress = $Script:SuppressRender
+    $Script:SuppressRender = $true
+    try {
+        $items = @(Get-AllKnownServers)
+    } finally {
+        $Script:SuppressRender = $oldSuppress
+    }
     $idx = 0
     if ($selectedKey) {
         for ($i = 0; $i -lt $items.Count; $i++) {
@@ -1998,31 +2057,122 @@ function Move-BansEditorSelection([int]$delta) {
     $Script:BansEditor.Index = $next
 }
 
+function Reorder-BansEditor {
+    # Re-sort the in-memory list after a toggle. This avoids re-reading every
+    # cached config (and the registry) on each Enter press.
+    if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
+    $old = @($Script:BansEditor.Items)
+    if (-not $old.Count) { return }
+    $selectedKey = $null
+    $idx = [int]$Script:BansEditor.Index
+    if ($idx -ge 0 -and $idx -lt $old.Count) { $selectedKey = [string]$old[$idx].key }
+    foreach ($item in $old) {
+        $item.banned = Test-ServerBanned $item.key
+        $item.sortBanned = $(if ($item.banned) { 0 } else { 1 })
+    }
+    $items = @($old | Sort-Object sortBanned, sortName, key)
+    $newIdx = 0
+    if ($selectedKey) {
+        for ($i = 0; $i -lt $items.Count; $i++) {
+            if ([string]$items[$i].key -eq $selectedKey) { $newIdx = $i; break }
+        }
+    }
+    $Script:BansEditor.Items = $items
+    $Script:BansEditor.Index = $newIdx
+    if ($Script:BansEditor.Offset -gt $newIdx) { $Script:BansEditor.Offset = $newIdx }
+    if ($Script:BansEditor.Offset -lt 0) { $Script:BansEditor.Offset = 0 }
+}
+
 function Toggle-BansEditorSelection {
     if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
     $items = @($Script:BansEditor.Items)
     if (-not $items.Count) { return }
     $idx = [Math]::Max(0, [Math]::Min([int]$Script:BansEditor.Index, $items.Count - 1))
     $item = $items[$idx]
-    if ($item.banned) {
-        Remove-BannedServer $item.key | Out-Null
-    } else {
-        Add-BannedServer $item.key 'bans editor' | Out-Null
+    # ban/unban logs an event; suppress its render so the editor repaints once,
+    # with the new state and order, instead of flashing the old list first
+    $Script:SuppressRender = $true
+    try {
+        if ($item.banned) {
+            Remove-BannedServer $item.key | Out-Null
+        } else {
+            Add-BannedServer $item.key 'bans editor' | Out-Null
+        }
+    } finally {
+        $Script:SuppressRender = $false
     }
-    Refresh-BansEditor
+    Reorder-BansEditor
+}
+
+function Start-BansEditor {
+    # Modal, fast input loop. While the editor is open the slower watchdog
+    # polling is paused so keystrokes never wait behind API/tunnel checks.
+    # A daemon heartbeat is still sent periodically.
+    if (-not $Interactive) { return }
+    try {
+        Open-BansEditor
+    } catch {
+        Log ("bans editor open failed: " + $_.Exception.Message)
+        Close-BansEditor
+        return
+    }
+    if ($Script:LayoutReady) { Render-Frame }
+    $beatAt = Get-Date
+    try {
+        while ($Script:BansEditor -and $Script:BansEditor.Active) {
+            $redraw = $false
+            if (-not $Script:LayoutReady) {
+                Init-ConsoleLayout
+                $redraw = $true
+            }
+            try {
+                while ([Console]::KeyAvailable) {
+                    $key = [Console]::ReadKey($true)
+                    $redraw = $true
+                    switch ($key.Key) {
+                        'UpArrow'    { Move-BansEditorSelection -delta -1 }
+                        'DownArrow'  { Move-BansEditorSelection -delta 1 }
+                        'PageUp'     { Move-BansEditorSelection -delta -10 }
+                        'PageDown'   { Move-BansEditorSelection -delta 10 }
+                        'Home'       { Move-BansEditorSelection -delta -9999 }
+                        'End'        { Move-BansEditorSelection -delta 9999 }
+                        'Enter'      { Toggle-BansEditorSelection }
+                        'R'          { Refresh-BansEditor }
+                        'Escape'     { Close-BansEditor }
+                        'L'          { Close-BansEditor }
+                        'Q'          { Close-BansEditor }
+                    }
+                    if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { break }
+                }
+            } catch { }
+            try {
+                if ([Console]::WindowWidth -ne $Script:LastWinW -or
+                    [Console]::WindowHeight -ne $Script:LastWinH) { $redraw = $true }
+            } catch { }
+            if ($redraw -and $Script:BansEditor -and $Script:BansEditor.Active -and $Script:LayoutReady) {
+                Render-Frame
+            }
+            if (((Get-Date) - $beatAt).TotalSeconds -ge $Script:Cfg.HeartbeatSec) {
+                try { $null = Send-Daemon -obj @{ action = 'heartbeat' } -WaitMs 300 } catch { }
+                $Script:DaemonUtil.LastBeat = Get-Date
+                $beatAt = Get-Date
+            }
+            Start-Sleep -Milliseconds 25
+        }
+    } finally {
+        $Script:SuppressRender = $false
+        if ($Script:BansEditor -and $Script:BansEditor.Active) { Close-BansEditor }
+        if ($Script:LayoutReady) { Render-Frame }
+    }
 }
 
 function Render-BansEditor {
     if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { return }
     if (-not $Script:LayoutReady) { return }
     try {
-        $w = [Console]::WindowWidth
-        $h = [Console]::WindowHeight
-        if ($w -ne $Script:LastWinW -or $h -ne $Script:LastWinH) {
-            try { [Console]::SetBufferSize($w, $h) } catch { }
-            $Script:LastWinW = $w
-            $Script:LastWinH = $h
-        }
+        if (-not (Sync-ConsoleSize)) { return }
+        $w = [int]$Script:LastWinW
+        $h = [int]$Script:LastWinH
 
         $items = @($Script:BansEditor.Items)
         $count = $items.Count
@@ -2049,7 +2199,7 @@ function Render-BansEditor {
 
         $rows = New-Object System.Collections.Generic.List[object]
         $rows.Add([pscustomobject]@{
-            Text = ('BANS / SERVERS   total {0}   banned {1}   showing {2}-{3}   [Up/Down] move   [Enter] toggle   [Esc/L] close' -f $count, $bannedCount, $first, $last)
+            Text = ('BANS / SERVERS   total {0}   banned {1}   showing {2}-{3}   [Up/Down] move   [Enter] toggle   [R] rescan   [Esc/L] close' -f $count, $bannedCount, $first, $last)
             Fg   = [ConsoleColor]::Cyan
             Bg   = [ConsoleColor]::Black
         })
@@ -2110,10 +2260,12 @@ function Render-BansEditor {
             $sel = $items[$idx]
             $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
             $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
-            $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   Esc/L close' -f $label, $sel.key, $action)
+            $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $action)
         }
         $rows.Add([pscustomobject]@{ Text = $footer; Fg = [ConsoleColor]::Cyan; Bg = [ConsoleColor]::Black })
 
+        $lastFg = $null
+        $lastBg = $null
         for ($row = 0; $row -lt $h; $row++) {
             $r = $null
             if ($row -lt $rows.Count) { $r = $rows[$row] }
@@ -2121,7 +2273,12 @@ function Render-BansEditor {
             else { $txt = ''; $fg = [ConsoleColor]::Gray; $bg = [ConsoleColor]::Black }
             if ($txt.Length -gt $w) { $txt = $txt.Substring(0, $w) } else { $txt = $txt.PadRight($w) }
             [Console]::SetCursorPosition(0, $row)
-            try { [Console]::ForegroundColor = $fg; [Console]::BackgroundColor = $bg } catch { }
+            try {
+                # only touch the console colors when they actually change; this
+                # halves the API calls on long runs of same-colored rows
+                if ($fg -ne $lastFg) { [Console]::ForegroundColor = $fg; $lastFg = $fg }
+                if ($bg -ne $lastBg) { [Console]::BackgroundColor = $bg; $lastBg = $bg }
+            } catch { }
             [Console]::Write($txt)
         }
         [Console]::ResetColor()
@@ -2144,14 +2301,9 @@ function Render-Frame {
     }
     if (-not $Script:LayoutReady) { return }
     try {
-        $w = [Console]::WindowWidth
-        $h = [Console]::WindowHeight
-        if ($w -ne $Script:LastWinW -or $h -ne $Script:LastWinH) {
-            # window resized: re-sync the buffer so the view can never scroll away
-            try { [Console]::SetBufferSize($w, $h) } catch { }
-            $Script:LastWinW = $w
-            $Script:LastWinH = $h
-        }
+        if (-not (Sync-ConsoleSize)) { return }
+        $w = [int]$Script:LastWinW
+        $h = [int]$Script:LastWinH
         $hdr = Get-HeaderLines
         $nHdr = [Math]::Min($hdr.Count, $h)
         $evRows = [Math]::Max(0, $h - $nHdr)
@@ -2192,7 +2344,7 @@ function Write-ConsoleEvent([string]$msg) {
     while ($Script:EventRing.Count -gt $Script:RingCap) {
         try { $Script:EventRing.RemoveAt(0) } catch { break }
     }
-    Render-Frame
+    if (-not $Script:SuppressRender) { Render-Frame }
 }
 
 if ($Watch) {
@@ -2323,34 +2475,29 @@ if ($Watch) {
         } catch { Log ("heartbeat error: " + $_.Exception.Message) }
 
         if ($Interactive) {
+            if (-not $Script:LayoutReady) { Init-ConsoleLayout }
             if ($Script:LayoutReady) { Render-Frame }
         }
-        # keep a tight console input loop: keys are handled within ~250ms,
-        # while the slower poll logic above still runs on its own cadence
-        for ($t = 0; $t -lt ([Math]::Max(1, [int]($PollSeconds * 4))); $t++) {
+        # keep a tight console input loop: keys and resizes are handled within
+        # ~100ms, while the slower poll logic above still runs on its own cadence
+        for ($t = 0; $t -lt ([Math]::Max(1, [int]($PollSeconds * 10))); $t++) {
             if ($Interactive) {
+                # recover from a transient render error or a resize while idle
+                if (-not $Script:LayoutReady) {
+                    Init-ConsoleLayout
+                    if ($Script:LayoutReady) { Render-Frame }
+                } else {
+                    try {
+                        if ([Console]::WindowWidth -ne $Script:LastWinW -or
+                            [Console]::WindowHeight -ne $Script:LastWinH) { Render-Frame }
+                    } catch { }
+                }
                 $drain = $true
                 while ($drain) {
                     $hit = $false
                     try { $hit = [Console]::KeyAvailable } catch { }
                     if ($hit) {
                         $key = [Console]::ReadKey($true)
-                        if ($Script:BansEditor -and $Script:BansEditor.Active) {
-                            switch ($key.Key) {
-                                'UpArrow' { Move-BansEditorSelection -delta -1 }
-                                'DownArrow' { Move-BansEditorSelection -delta 1 }
-                                'PageUp' { Move-BansEditorSelection -delta -10 }
-                                'PageDown' { Move-BansEditorSelection -delta 10 }
-                                'Home' { Move-BansEditorSelection -delta -9999 }
-                                'End' { Move-BansEditorSelection -delta 9999 }
-                                'Enter' { Toggle-BansEditorSelection }
-                                'Escape' { Close-BansEditor }
-                                'L' { Close-BansEditor }
-                                'Q' { Close-BansEditor }
-                            }
-                            if ($Script:LayoutReady) { Render-Frame }
-                            continue
-                        }
                         switch ($key.Key) {
                             'T' { Log 'manual switch requested [T]'; Invoke-Failover -Reason 'manual' | Out-Null }
                             'B' {
@@ -2365,7 +2512,7 @@ if ($Watch) {
                                 Invoke-Failover -Reason 'manual-ban' | Out-Null
                             }
                             'L' {
-                                Open-BansEditor
+                                Start-BansEditor
                             }
                             'R' {
                                 Log 'config cache rescan requested [R]'
@@ -2406,7 +2553,7 @@ if ($Watch) {
                     }
                 }
             }
-            Start-Sleep -Milliseconds 250
+            Start-Sleep -Milliseconds 100
         }
     }
 }
