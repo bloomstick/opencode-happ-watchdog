@@ -28,7 +28,10 @@ app, and sends `continue` to every affected top-level session.
    `Rate limit exceeded`, `Too many requests`, and free-usage errors
    (`Free usage limit reached`, `Free usage exceeded`), and the OpenCode session API
    for `Endpoint is unavailable` and connection-loss (`ECONNRESET`) failures
-   (connection resets never reach the server log).
+   (connection resets never reach the server log). An exact `Free usage limit reached.
+   Subscribe to OpenCode Go to keep going: https://opencode.ai/go` error automatically
+   bans the current server and is shown in **orange** in the bans editor (manual bans
+   stay red).
 2. **Switches the Happ proxy server** to a **random** previously *unused*, *unbanned*
    server from your subscription. It talks to the Happ daemon (`happd`) over its named
    pipe using the app's own JSON protocol:
@@ -55,11 +58,20 @@ State (active server, used servers, prompted sessions) is kept in `state.json`, 
 "previously unused" is tracked across watchdog restarts. Banned servers live in a
 separate `bans.json`; clearing the used list never un-bans anything.
 
+Automatic failures use a **fast path**: no cache rescan when the cache is already
+populated, no pre-switch session scan (the post-reload scan still runs), a short
+OpenCode close grace, shorter daemon/TUN waits, two 4-second exit checks instead of
+the full verify, and no plain-route probe. If another timeout arrives within 180
+seconds of a switch, the next switch may start after only **8 seconds** instead of
+the normal two-minute cooldown. Quota errors bypass the cooldown entirely. Manual
+`T`/`B` actions keep the thorough path.
+
 ### Failure classes and triggers
 
 | class | detection source | reaction |
 | --- | --- | --- |
-| rate | opencode.log tail (`Rate limit exceeded`, `Too many requests`, `Free usage limit reached`, `Free usage exceeded`) + session API | immediate failover |
+| rate | opencode.log tail (`Rate limit exceeded`, `Too many requests`, `Free usage limit reached`, `Free usage exceeded`) + session API | fast failover; 8s cooldown after a recent switch |
+| quota | exact `Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go` in the log | **auto-ban current server (orange)** + immediate fast failover, bypassing cooldown |
 | endpoint | session API (`Endpoint is unavailable`) | same-server `continue` retry after ~60s; switch after 2 failed rounds |
 | connreset | session API (`ECONNRESET` / `Connection lost while reading the response`) | **3 failures within 3 minutes -> failover** |
 | tunnel-dead | plain system-route probes (two URLs, 30s cadence) | route dead twice in a row (~60s) -> failover; a vanished TUN adapter is restored directly |
@@ -77,11 +89,18 @@ Notable behaviors:
   ring; the status header always stays on top and log volume or window resizes can
   never scroll it away.
 
-Free-usage errors are OpenCode's free-model quota. The watchdog treats them like any
-other rate limit and rotates immediately. If the quota is tied to the public exit IP,
-another subscription server can bring a fresh window. Subscription pool IPs may be
-shared with other users, so a freshly selected IP can already be partially burned; if
-rotation keeps landing on exhausted IPs, the quota window itself is the remaining wait.
+Free-usage errors are OpenCode's free-model quota. The watchdog rotates immediately,
+and the exact OpenCode Go free-usage message automatically bans the exhausted server.
+If the quota is tied to the public exit IP, another subscription server can bring a
+fresh window. Subscription pool IPs may be shared with other users, so a freshly
+selected IP can already be partially burned; if rotation keeps landing on exhausted
+IPs, the quota window itself is the remaining wait.
+
+Only the exact OpenCode Go free-usage message triggers the automatic ban. Generic
+`Rate limit exceeded`/`Too many requests` errors still switch servers but do not
+create a ban. Automatic quota bans are stored as objects in `bans.json`
+(`source: automatic`, `kind: auto`, `reason`, `at`); old timestamp-string bans remain
+manual. An existing manual ban is never rewritten by the automatic path.
 
 ### Server exhaustion / rotation
 
@@ -98,6 +117,10 @@ Bans are deliberately different from the used-list:
 - `state.json` records **used** servers; clearing them (`C`) makes them candidates again.
 - `bans.json` records **banned** servers; they are *never* selected, including during
   rotation cycle 2. The only way back into the pool is to unban them explicitly.
+- **Manual** bans (timestamp strings, `B`, command line, editor) render **red**.
+- **Automatic quota** bans (objects with `kind: auto`) render **orange** and are marked
+  `[AUTO]`; the header shows their count. They persist across restarts and are cleared
+  only by unbanning.
 - The dashboard shows a banned count and marks the current server as `[BANNED]` if it
   was banned while connected.
 
@@ -115,13 +138,16 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListBanned
 
 In the interactive dashboard, `B` bans the server currently in use and immediately
 switches away from it. `L` opens the bans/server editor: every known cached, active,
-used, or banned server is listed with its cached name, banned entries first and in red.
-Use `Up`/`Down` (plus `PgUp`/`PgDn`, `Home`/`End`) to move and press `Enter` to
-ban/unban the selected server. `R` rescans the cache, and `Esc` or `L` closes the
-editor. The selection follows the server if toggling moves it between the banned and
-unbanned groups. The editor runs as a fast modal loop (25 ms input polling) so movement
-stays responsive; automatic watchdog polling pauses while it is open and resumes on
-close (the daemon heartbeat continues).
+used, or banned server is listed with its cached name, banned entries first -
+**red = manual ban, orange = automatic quota ban**. Use `Up`/`Down` (plus
+`PgUp`/`PgDn`, `Home`/`End`) to move and press `Enter` to ban/unban the selected
+server. `R` rescans the cache, and `Esc` or `L` closes the editor. The selection follows
+the server if toggling moves it between the banned and unbanned groups. The editor runs
+as a fast modal loop (25 ms input polling) so movement stays responsive; automatic
+watchdog polling pauses while it is open and resumes on close (the daemon heartbeat
+continues). The server-name index is built once at watchdog startup and cached until
+the config directory changes, so opening the editor does not block on parsing every
+captured config.
 
 Happ sometimes exposes several names for the same `host:port` (or a memory capture is
 malformed). The editor lists those names as separate alias rows marked `~`; they share
@@ -130,7 +156,10 @@ use the same `host:port` are stored as **profile** rows marked `@`
 (`configs/<host>_<port>__<hash>.json`, key `host:port#hash`); they are independently
 selectable and bannable. An endpoint ban (`host:port`) remains a wildcard covering every
 profile on that endpoint; a profile ban (`host:port#hash`) affects only that profile.
-The header counts `host:port` endpoints separately from profile rows.
+The header counts `host:port` endpoints separately from profile rows. If a profile has
+its own exact ban **and** is also covered by an endpoint wildcard, `Enter` removes the
+exact ban first and leaves the endpoint's separate ban in place; unban the endpoint row
+to clear the wildcard.
 
 The editor is not a browser for the whole Happ subscription: only endpoints/profiles
 whose full xray config has been captured (or that are active, used, or banned) can
@@ -204,7 +233,13 @@ endpoint and records that once (profile identity cannot be inferred from the soc
 alone, so it falls back to the endpoint). Cached domain endpoints are resolved to
 their A records for this comparison. If saved state exists but the core has been
 running on a different endpoint for more than a minute, the watchdog corrects the
-saved active server instead of continuing to trust stale state.
+saved active server instead of continuing to trust stale state. When state and the
+registry disagree but both endpoints have connections, the endpoint with the live
+xray connections wins; this repairs state written by older builds that recorded the
+registry snapshot without adopting its server. If the active server was selected in
+Happ but its config was never captured, failover uses a valid cached full config as
+the inbound/routing skeleton and replaces all server outbounds with the target; it
+never reverts to that fallback server on a failed attempt.
 
 This is also why the dashboard can show a different server than the Happ window after a
 failover - the watchdog is right about the traffic path, and the GUI is still showing
@@ -252,8 +287,8 @@ settle, re-applies the pinned buffer at the top-left, then redraws.
 
 | key | action |
 | --- | --- |
-| `T` | switch to a random unused, unbanned server now (same flow as automatic failover) |
-| `B` | ban the current server and switch away from it immediately |
+| `T` | switch to a random unused, unbanned server now (manual/thorough flow) |
+| `B` | ban the current server and switch away from it immediately (manual ban = red) |
 | `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `R` rescans, `Esc`/`L` closes) |
 | `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure |
 | `C` | clear the used-server list; bans are unchanged |
@@ -292,6 +327,12 @@ Register-ScheduledTask -TaskName 'opencode-happ-watchdog' -Action $act `
 Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptions):
 
 - `PollSeconds`, `CooldownSec` - loop cadence and the minimum pause between failovers
+- `FastRetrySec` / `ConsecutiveWindowSec` - after a switch, a follow-up automatic
+  failure within the window may switch again after only 8s (defaults 8 / 180)
+- `FastVerifyTries` / `FastVerifyTimeoutSec` - fast-path exit checks (default 2 tries,
+  4s each; quota errors bypass the cooldown)
+- `QuotaBanPattern` - exact OpenCode Go free-usage message that triggers an automatic
+  orange ban
 - `ContinueText` - prompt sent to stuck sessions (default `continue`)
 - `ContinueDelaySec` - settle wait after the OpenCode restart before prompting
 - `RestartOpenCode` - stop the desktop app before a switch and start it afterwards
@@ -312,7 +353,8 @@ are command-line overrides for the loop.
 
 - `state.json` - active server, used servers, prompted sessions, route/deadline markers,
   exit IP history
-- `bans.json` - permanently banned servers; never cleared by the used-list reset
+- `bans.json` - permanently banned servers; never cleared by the used-list reset.
+  Timestamp strings are manual (red); objects with `kind: auto` are quota bans (orange)
 - `failover.log` - rolling transcript of everything the watchdog does
 - `configs/*.json` - cached per-server xray config templates extracted from the Happ GUI
   process memory. **These contain your subscription's connection credentials - keep them

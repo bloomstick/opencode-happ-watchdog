@@ -61,6 +61,7 @@ $Script:Cfg = @{
     ProcessId         = 'xray-core'
     ContinueText      = 'continue'
     RateLimitPattern  = '(Rate limit exceeded|Too many requests|Free usage limit reached|Free usage exceeded)'
+    QuotaBanPattern   = 'Free usage limit reached\. Subscribe to OpenCode Go to keep going: https://opencode\.ai/go'
     EndpointPattern   = 'Endpoint is unavailable'
     ContinueDelaySec  = 5     # wait after app/service (re)connect before continue prompts
     RestartOpenCode   = $true
@@ -68,6 +69,10 @@ $Script:Cfg = @{
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
+    FastRetrySec       = 8     # shorter cooldown for another timeout shortly after a switch
+    ConsecutiveWindowSec = 180 # how long a follow-up failure counts as a consecutive timeout
+    FastVerifyTries    = 2     # verification attempts after a fast switch
+    FastVerifyTimeoutSec = 4   # curl timeout per fast verification attempt
     TunExe             = 'C:\Program Files\FlyFrogLLC\Happ\tun\sing-box.exe'
     TunConfigPath      = (Join-Path $env:LOCALAPPDATA 'Happ\config.json')
     TunIface           = 'happ-tun'
@@ -204,6 +209,68 @@ function Get-BannedEntries {
     if (-not $Script:Bans) { return @() }
     return @($Script:Bans.PSObject.Properties | Sort-Object Name)
 }
+function Get-BanInfo([object]$value) {
+    # Old bans are plain timestamps -> manual. Automatic quota bans are stored
+    # as objects so the editor can distinguish them without guessing.
+    $at = ''; $source = ''; $reason = ''; $kind = ''
+    if ($value -is [string]) {
+        $at = [string]$value
+    } elseif ($null -ne $value) {
+        try { $at = [string]$value.at } catch { }
+        try { $source = [string]$value.source } catch { }
+        try { $reason = [string]$value.reason } catch { }
+        try { $kind = [string]$value.kind } catch { }
+        if (-not $kind) {
+            try { if ([bool]$value.auto) { $kind = 'auto' } } catch { }
+        }
+    }
+    if (-not $kind) { $kind = 'manual' }
+    $auto = ($kind -in @('auto','quota','limit')) -or
+            ($source -match 'quota|free usage|limit') -or
+            ($reason -match 'quota|free usage|limit')
+    return [pscustomobject]@{
+        at = $at; source = $source; reason = $reason; kind = $kind; auto = [bool]$auto
+    }
+}
+function Get-ServerBanInfo([string]$key) {
+    if (-not $key) { return $null }
+    if (-not $Script:Bans) { Load-Bans }
+    if (-not $Script:Bans) { return $null }
+    $banKey = $key
+    $wildcard = $false
+    $prop = $Script:Bans.PSObject.Properties[$banKey]
+    if (-not $prop -and $key -match '^(.+:[0-9]{1,5})#[0-9a-fA-F]+$') {
+        $banKey = $Matches[1]
+        $prop = $Script:Bans.PSObject.Properties[$banKey]
+        $wildcard = [bool]$prop
+    }
+    if (-not $prop) { return $null }
+    $info = Get-BanInfo $prop.Value
+    $info | Add-Member -NotePropertyName key -NotePropertyValue $banKey -Force
+    $info | Add-Member -NotePropertyName wildcard -NotePropertyValue $wildcard -Force
+    $info | Add-Member -NotePropertyName requestedKey -NotePropertyValue $key -Force
+    return $info
+}
+function Add-AutoBannedServer([string]$key, [string]$reason = 'free usage limit') {
+    # Keep a manual ban manual if it already exists; otherwise create a
+    # quota-specific exact ban (even when an endpoint wildcard covers a profile).
+    if (-not $key) { return $false }
+    Load-Bans
+    if ($Script:Bans.PSObject.Properties[$key]) {
+        Log ("server is already banned: " + $key)
+        return $false
+    }
+    $record = [pscustomobject]@{
+        at     = (Get-Date -Format 'o')
+        source = 'automatic'
+        reason = $reason
+        kind   = 'auto'
+    }
+    Add-Member -InputObject $Script:Bans -NotePropertyName $key -NotePropertyValue $record -Force
+    Save-Bans
+    Log ("AUTO-BANNED {0} [{1}] - orange in the bans editor; clear-used does not affect bans" -f $key, $reason)
+    return $true
+}
 function Add-BannedServer([string]$key, [string]$source = '') {
     if (-not $key) { return $false }
     Load-Bans
@@ -318,6 +385,11 @@ function Get-ActiveServer {
                             [string]$seen.name -ne [string]$reg.name)
             $guidChanged = ([string]$seen.guid -ne [string]$reg.guid)
             if ($identityChanged -or $nameChanged -or $guidChanged) { $regChanged = $true }
+        } else {
+            # No registry snapshot yet (first run after state migration). The
+            # registry is the GUI's authoritative selection; do not keep a
+            # stale endpoint from an old watchdog run.
+            $regChanged = $true
         }
     }
 
@@ -359,7 +431,31 @@ function Get-ActiveServer {
             }
         }
     }
-    if ($reg -and $reg.host -and (-not $active -or ($regChanged -and -not $adoptedLive))) {
+    # If state and the Happ registry disagree, the live xray connections are the
+    # tie-breaker. This also repairs state written by older builds that adopted
+    # the registry snapshot without adopting its active server.
+    if ($reg -and $reg.host -and $active -and -not $adoptedLive) {
+        $activeBase = Get-ServerKey $active
+        if ($activeBase -match '#[0-9a-fA-F]+$') { $activeBase = $activeBase -replace '#[0-9a-fA-F]+$', '' }
+        if ($activeBase -ne $regKey) {
+            $regLive = Get-EndpointLiveConnections ([string]$reg.host) ([int]$reg.port)
+            $activeLive = Get-EndpointLiveConnections ([string]$active.host) ([int]$active.port)
+            if ($regLive -ge 2 -and $regLive -gt $activeLive) {
+                $regChanged = $true
+                Log ("registry server {0} has {1} live connections; adopting it over stale state {2}" -f $regKey, $regLive, $activeBase)
+            } elseif ($activeLive -ge 2 -and $activeLive -gt $regLive) {
+                $regChanged = $false
+            }
+        }
+    }
+
+    $adoptRegistry = $regChanged
+    if ($adoptRegistry -and $active -and -not $seen) {
+        $activeBase = Get-ServerKey $active
+        if ($activeBase -match '#[0-9a-fA-F]+$') { $activeBase = $activeBase -replace '#[0-9a-fA-F]+$', '' }
+        if ($activeBase -eq $regKey) { $adoptRegistry = $false }
+    }
+    if ($reg -and $reg.host -and (-not $active -or ($adoptRegistry -and -not $adoptedLive))) {
         # If the registry name matches a captured profile (e.g. a country on
         # the same endpoint as another server), preserve that profile identity.
         $regTarget = $reg
@@ -441,7 +537,7 @@ $Script:OwnedTun = $null
 
 function Start-TunBurst {
     # replicate the GUI's system-wide tunnel: daemon start-tun on the sing-box TUN
-    param([string]$configPath)
+    param([string]$configPath, [switch]$Fast)
     if (-not (Test-Path $configPath)) { Log ("TUN config missing: " + $configPath); return $null }
     $msgs = @(
         @{
@@ -461,8 +557,8 @@ function Start-TunBurst {
     )
     $burst = New-Burst -messages $msgs -rids @('tun-start')
     if (-not $burst) { Log 'start-tun burst failed'; return $null }
-    Start-Sleep -Milliseconds 1200
-    $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs 2500
+    Start-Sleep -Milliseconds $(if ($Fast) { 650 } else { 1200 })
+    $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs $(if ($Fast) { 900 } else { 2500 })
     foreach ($f in $resp) {
         if ($f.'request-id' -eq 'tun-start') { Log ("start-tun resp: status=" + $f.status + $(if ($f.message) { ' ' + $f.message } else { '' })) }
     }
@@ -470,8 +566,9 @@ function Start-TunBurst {
 }
 
 function Get-PlainRouteIp {
+    param([int]$TimeoutSec = 10)
     try {
-        $raw = & curl.exe -s --max-time 10 $Script:Cfg.WebCheckUrl 2>$null
+        $raw = & curl.exe -s --max-time ([Math]::Max(1, [int]$TimeoutSec)) $Script:Cfg.WebCheckUrl 2>$null
         $joined = ($raw -join '')
         $ip = $null
         try { $ip = ($joined | ConvertFrom-Json).ip } catch { }
@@ -1041,8 +1138,16 @@ function Get-CachedServerAliasMap {
     # Endpoint -> every captured display name for that endpoint. A valid
     # host_port file is the primary name; malformed files (e.g. a corrupted
     # address) and remarksAliases contribute alternate names.
-    $map = @{}
     $files = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    $stamp = 0L
+    foreach ($f in $files) {
+        if ($f.LastWriteTimeUtc.Ticks -gt $stamp) { $stamp = $f.LastWriteTimeUtc.Ticks }
+    }
+    $signature = ('{0}|{1}|{2}' -f $files.Count, $stamp, $Script:Cfg.ConfigCacheDir)
+    if ($Script:CachedAliasMap -and $Script:CacheAliasSignature -eq $signature) {
+        return $Script:CachedAliasMap
+    }
+    $map = @{}
     foreach ($f in $files) {
         if ($f.BaseName -match '__[0-9a-fA-F]+$') { continue }
         if ($f.BaseName -notmatch '^(.+)_(\d+)$') { continue }
@@ -1069,6 +1174,8 @@ function Get-CachedServerAliasMap {
         $n = ([string]$meta.remarks).Trim()
         if ($n -and -not $map[$key].Contains($n)) { $map[$key].Add($n) }
     }
+    $Script:CachedAliasMap = $map
+    $Script:CacheAliasSignature = $signature
     return $map
 }
 
@@ -1214,8 +1321,72 @@ function Get-LiveServerFromCore {
     }
 }
 
+function Get-EndpointLiveConnections {
+    # Count established xray connections to a specific endpoint, even when the
+    # active server was selected manually in Happ and is not in our cache.
+    param([string]$srvHost, [int]$srvPort)
+    if (-not $srvHost -or $srvPort -lt 1) { return 0 }
+    $now = Get-Date
+    $cacheKey = ('{0}:{1}' -f $srvHost, $srvPort)
+    try {
+        if ($Script:EndpointLiveCache -and $Script:EndpointLiveCache.ContainsKey($cacheKey)) {
+            $hit = $Script:EndpointLiveCache[$cacheKey]
+            if (($now - $hit.at).TotalSeconds -lt 3) { return [int]$hit.count }
+        }
+    } catch { }
+    $ips = @()
+    if ($srvHost -match '^\d{1,3}(\.\d{1,3}){3}$') {
+        $ips = @($srvHost)
+    } else {
+        try {
+            $ips = @(Resolve-DnsName -Name $srvHost -Type A -DnsOnly -QuickTimeout -ErrorAction Stop |
+                Where-Object { $_.IPAddress } | ForEach-Object { [string]$_.IPAddress })
+        } catch { $ips = @() }
+    }
+    $count = 0
+    if ($ips.Count -gt 0) {
+        foreach ($proc in @(Get-Process xray -ErrorAction SilentlyContinue)) {
+            try {
+                $conns = @(Get-NetTCPConnection -OwningProcess $proc.Id -State Established -ErrorAction SilentlyContinue)
+            } catch { continue }
+            foreach ($c in $conns) {
+                $addr = ([string]$c.RemoteAddress) -replace '^::ffff:', ''
+                if ([int]$c.RemotePort -eq $srvPort -and ($ips -contains $addr)) { $count++ }
+            }
+        }
+    }
+    if (-not $Script:EndpointLiveCache) { $Script:EndpointLiveCache = @{} }
+    $Script:EndpointLiveCache[$cacheKey] = [pscustomobject]@{ at = $now; count = $count }
+    return $count
+}
+
+function Get-FallbackTemplate {
+    # A manually selected server is sometimes not present in the captured Happ
+    # memory cache. A cached full config still supplies the same inbound and
+    # routing skeleton; Build-Config replaces every server outbound with the
+    # requested target. Prefer a valid recently written config.
+    $files = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTime -Descending)
+    foreach ($f in $files) {
+        try {
+            $tpl = Get-Content $f.FullName -Raw -Encoding utf8 | ConvertFrom-Json
+            Repair-CacheConfigKeys $tpl
+            $hasInbound = @($tpl.inbounds | Where-Object { $_.protocol -eq 'socks' }).Count -gt 0
+            $hasServer = @($tpl.outbounds | Where-Object {
+                $_.protocol -in @('vless','hysteria','vmess','trojan') -and $_.settings
+            }).Count -gt 0
+            if ($hasInbound -and $hasServer) {
+                Log ("active server template unavailable; using cached template {0}" -f $f.BaseName)
+                return $tpl
+            }
+        } catch { }
+    }
+    return $null
+}
+
 function Get-CurrentTemplate {
-    param([object]$Server)
+    param([object]$Server, [switch]$Fast)
+    $Script:LastTemplateFallback = $false
     if (-not $Server) { $Server = Get-ActiveServer }
     if (-not $Server -or -not $Server.host) { Log 'cannot determine the active server'; return $null }
     $serverKey = Get-ServerKey $Server
@@ -1230,6 +1401,15 @@ function Get-CurrentTemplate {
             return $tpl
         } catch { Log ("template parse failed: " + $_.Exception.Message) }
     }
+    if ($Fast) {
+        # Do not spend seconds scanning the GUI on an urgent switch. A cached
+        # full config is enough to build the target tunnel.
+        $fastFallback = Get-FallbackTemplate
+        if ($fastFallback) {
+            $Script:LastTemplateFallback = $true
+            return $fastFallback
+        }
+    }
     Log ("active server {0}_{1} not in cache; scanning GUI memory..." -f $Server.host, $Server.port)
     Update-ConfigCache | Out-Null
     $file = Get-CachedConfigPath ([string]$Server.host) ([int]$Server.port) $serverKey
@@ -1242,6 +1422,11 @@ function Get-CurrentTemplate {
             Repair-CacheConfigKeys $tpl
             return $tpl
         } catch { }
+    }
+    $fallback = Get-FallbackTemplate
+    if ($fallback) {
+        $Script:LastTemplateFallback = $true
+        return $fallback
     }
     Log "active server template unavailable"
     return $null
@@ -1267,10 +1452,11 @@ function Build-Config {
 }
 
 function Test-ProxyExit {
-    param([int]$tries = 4)
+    param([int]$tries = 4, [int]$TimeoutSec = 10, [int]$RetryDelayMs = 2000)
+    $maxTime = [Math]::Max(1, [int]$TimeoutSec)
     for ($i = 1; $i -le $tries; $i++) {
         try {
-            $raw = & curl.exe -s --max-time 10 --socks5-hostname 127.0.0.1:10808 $Script:Cfg.WebCheckUrl 2>$null
+            $raw = & curl.exe -s --max-time $maxTime --socks5-hostname 127.0.0.1:10808 $Script:Cfg.WebCheckUrl 2>$null
             if ($LASTEXITCODE -eq 0) {
                 $joined = ($raw -join '')
                 $ip = $null
@@ -1288,7 +1474,7 @@ function Test-ProxyExit {
                 }
             }
         } catch { }
-        Start-Sleep -Seconds 2
+        if ($i -lt $tries) { Start-Sleep -Milliseconds ([Math]::Max(0, [int]$RetryDelayMs)) }
     }
     return ''
 }
@@ -1344,7 +1530,7 @@ function Invoke-KillCore {
 function Start-CoreBurst {
     # one burst: hello + start + stdin(config) + close-stdin; connection stays open (owner)
     # returns the burst object (Client + Recv) so callers can drain process events
-    param([string]$configJson)
+    param([string]$configJson, [switch]$Fast)
     $rids = @('start-switch', 'stdin-switch', 'clostdin-switch')
     $msgs = @(
         @{ action = 'start'; 'process-id' = $Script:Cfg.ProcessId; 'executable' = $Script:Cfg.XrayExe; 'arguments' = @(); 'working-dir' = $Script:Cfg.XrayWorkDir; 'auto-restart' = $true; 'max-restart-attempts' = 3; 'restart-delay-ms' = 1000 },
@@ -1353,8 +1539,8 @@ function Start-CoreBurst {
     )
     $burst = New-Burst -messages $msgs -rids $rids
     if (-not $burst) { return $null }
-    Start-Sleep -Milliseconds 1200
-    $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs 2500
+    Start-Sleep -Milliseconds $(if ($Fast) { 650 } else { 1200 })
+    $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs $(if ($Fast) { 900 } else { 2500 })
     foreach ($f in $resp) {
         if ($f.status -and $f.'request-id' -eq 'start-switch') { Log ("start resp: status=" + $f.status + " " + $f.message) }
         if ($f.'request-id' -eq 'stdin-switch') { Log ("stdin resp: status=" + $f.status) }
@@ -1364,7 +1550,7 @@ function Start-CoreBurst {
 }
 
 function Invoke-PipeSwitch {
-    param([pscustomobject]$Target)
+    param([pscustomobject]$Target, [switch]$Fast)
     Load-Bans
     $targetKey = Get-ServerKey $Target
     if (Test-ServerBanned $targetKey) {
@@ -1372,8 +1558,9 @@ function Invoke-PipeSwitch {
         return $false
     }
     $curSrv = Get-ActiveServer
-    $template = Get-CurrentTemplate -Server $curSrv
+    $template = Get-CurrentTemplate -Server $curSrv -Fast:$Fast
     if (-not $template) { return $false }
+    $templateFallback = [bool]$Script:LastTemplateFallback
     $curBanned = $false
     if ($curSrv) { $curBanned = Test-ServerBanned (Get-ServerKey $curSrv) }
     $newOut = Get-CachedOutbound -srvHost $Target.host -srvPort $Target.port -ProfileKey $targetKey
@@ -1387,14 +1574,15 @@ function Invoke-PipeSwitch {
     $newJson = ConvertTo-Json -InputObject $newCfg -Compress -Depth 30
     $oldJson = ConvertTo-Json -InputObject $template -Compress -Depth 30
 
-    Log ("switching to {0}:{1} via daemon pipe (burst mode)..." -f $Target.host, $Target.port)
-    $exitIpBefore = Test-ProxyExit -tries 1
-    if ($exitIpBefore) { Log ("current exit IP before switch: " + $exitIpBefore) }
+    Log ("switching to {0}:{1} via daemon pipe (burst mode{2})..." -f $Target.host, $Target.port, $(if ($Fast) { ', fast' } else { '' }))
+    $exitIpBefore = ''
+    try { $exitIpBefore = [string]$Script:State.exitIp } catch { }
+    if ($exitIpBefore) { Log ("last recorded exit IP before switch: " + $exitIpBefore) }
 
     # 1. release any core we own, stop/kill the running core
     if ($Script:OwnedClient) { try { $Script:OwnedClient.Dispose() } catch {}; $Script:OwnedClient = $null }
-    try { $null = (Send-Daemon -obj @{ action = 'stop'; 'process-id' = $Script:Cfg.ProcessId } -WaitMs 2000) } catch { }
-    Start-Sleep -Milliseconds 700
+    try { $null = (Send-Daemon -obj @{ action = 'stop'; 'process-id' = $Script:Cfg.ProcessId } -WaitMs $(if ($Fast) { 800 } else { 2000 })) } catch { }
+    Start-Sleep -Milliseconds $(if ($Fast) { 350 } else { 700 })
     $alive = Get-Process xray -ErrorAction SilentlyContinue
     if ($alive) {
         Log ('GUI-owned core still running - OS-level kill')
@@ -1405,18 +1593,23 @@ function Invoke-PipeSwitch {
         }
     }
     # 2. start with the new config; keep the owner connection open
-    $Script:OwnedBurst = Start-CoreBurst -configJson $newJson
+    $Script:OwnedBurst = Start-CoreBurst -configJson $newJson -Fast:$Fast
     $Script:OwnedClient = if ($Script:OwnedBurst) { $Script:OwnedBurst.Client } else { $null }
     if (-not $Script:OwnedBurst) { Log 'burst start failed'; return $false }
     # 2b. restore the system-wide TUN (kills nothing: own burst, kept alive)
     if ($Script:OwnedTun) { try { $Script:OwnedTun.Client.Dispose() } catch {} }
-    $Script:OwnedTun = Start-TunBurst -configPath $Script:Cfg.TunConfigPath
-    Start-Sleep -Milliseconds 1500
+    $Script:OwnedTun = Start-TunBurst -configPath $Script:Cfg.TunConfigPath -Fast:$Fast
+    Start-Sleep -Milliseconds $(if ($Fast) { 700 } else { 1500 })
     $tun = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'happ' }
     if ($tun) { Log ("TUN adapter up: {0} ({1})" -f $tun.Name, $tun.Status) } else { Log 'WARNING: TUN adapter did not come up' }
     # 3. verify (socks exit IP + the plain system-route IP)
-    $exitIpAfter = Test-ProxyExit
-    $plainIp = Get-PlainRouteIp
+    if ($Fast) {
+        $exitIpAfter = Test-ProxyExit -tries ([int]$Script:Cfg.FastVerifyTries) -TimeoutSec ([int]$Script:Cfg.FastVerifyTimeoutSec) -RetryDelayMs 400
+        $plainIp = '(fast verify: skipped)'
+    } else {
+        $exitIpAfter = Test-ProxyExit
+        $plainIp = Get-PlainRouteIp
+    }
     if ($exitIpAfter) {
         Log ("SWITCH OK -> {0}:{1} (core exit IP: {2}{3}; system route: {4})" -f $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
         Update-Reliability (Get-ServerKey $Target) $true $exitIpAfter
@@ -1428,15 +1621,29 @@ function Invoke-PipeSwitch {
     if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
     $Script:OwnedClient = $null; $Script:OwnedBurst = $null
     $null = Invoke-KillCore
-    if ($curBanned) {
-        # Never reconnect to a banned server, even during a failed-switch revert.
-        Log 'original server is banned - refusing to revert; no proxy is active'
+    if ($curBanned -or $templateFallback) {
+        # Never reconnect to a banned server, and never revert to a fallback
+        # template whose server is not the real active server. In either case
+        # the next failover attempt can start cleanly from another cached config.
+        if ($curBanned) {
+            Log 'original server is banned - refusing to revert; no proxy is active'
+        } else {
+            Log 'original server config was not cached - refusing to revert to a fallback template; no proxy is active'
+        }
         return $false
     }
-    $Script:OwnedBurst = Start-CoreBurst -configJson $oldJson
+    $Script:OwnedBurst = Start-CoreBurst -configJson $oldJson -Fast:$Fast
     $Script:OwnedClient = if ($Script:OwnedBurst) { $Script:OwnedBurst.Client } else { $null }
     # TUN stays alive across the revert (it forwards into the fixed socks port)
-    if ($Script:OwnedBurst -and (Test-ProxyExit)) {
+    $revertOk = $false
+    if ($Script:OwnedBurst) {
+        if ($Fast) {
+            $revertOk = [bool](Test-ProxyExit -tries 1 -TimeoutSec ([int]$Script:Cfg.FastVerifyTimeoutSec))
+        } else {
+            $revertOk = [bool](Test-ProxyExit)
+        }
+    }
+    if ($revertOk) {
         if ($curSrv) { Set-ActiveServer $curSrv }
         Log 'reverted to original server'
     } else { Log 'REVERT FAILED - reconnect Happ manually!' }
@@ -1474,7 +1681,7 @@ function Get-FailedSessions {
         # not our 'continue' and not opencode's restart note) means the session
         # moved on and we should leave it alone. Idle/system markers and error-less
         # assistant records are translucent: they must not mask an older failure.
-        $errKind = $null; $errMsg = $null; $errCreated = $null
+        $errKind = $null; $errMsg = $null; $errCreated = $null; $errQuota = $false
         foreach ($m in $msgsResp.data) {
             if ($m.type -eq 'user') {
                 $txt = ''
@@ -1485,13 +1692,18 @@ function Get-FailedSessions {
             if ($m.type -eq 'system') { continue }
             if ($m.type -match 'assistant|idle') {
                 $kind = $null
+                $quotaHit = $false
                 if ($m.error -and $m.error.message) {
-                    if ($m.error.message -match $Script:Cfg.RateLimitPattern) { $kind = 'rate' }
+                    if ($m.error.message -match $Script:Cfg.RateLimitPattern) {
+                        $kind = 'rate'
+                        $quotaHit = [bool]($m.error.message -match $Script:Cfg.QuotaBanPattern)
+                    }
                     elseif ($m.error.message -match $Script:Cfg.EndpointPattern) { $kind = 'endpoint' }
                     elseif ($m.error.message -match $Script:Cfg.ConnResetPattern) { $kind = 'connreset' }
                 }
                 if ($kind -and ($kinds -contains $kind) -and (-not $errKind)) {
                     $errKind = $kind
+                    $errQuota = $quotaHit
                     $errMsg = $m.error.message.Substring(0, [Math]::Min(140, $m.error.message.Length))
                     try { $errCreated = [int64]$m.time.created } catch { $errCreated = $null }
                 }
@@ -1512,6 +1724,7 @@ function Get-FailedSessions {
         $result += [pscustomobject]@{
             id = $s.id; title = $s.title; when = $updated; kind = $errKind
             errCreated = $errCreated
+            quota = $errQuota
             msg = $errMsg
         }
     }
@@ -1536,6 +1749,7 @@ function Get-OpenCodeLeftover {
 }
 
 function Stop-OpencodeDesktop {
+    param([switch]$Fast)
     $app = @(Get-OpenCodeDesktopProcess)
     $svc = @(Get-OpenCodeServiceProcess)
     if (-not $app.Count -and -not $svc.Count) {
@@ -1555,7 +1769,9 @@ function Stop-OpencodeDesktop {
         foreach ($p in $main) {
             try { $null = $p.CloseMainWindow() } catch { }
         }
-        $deadline = (Get-Date).AddSeconds([Math]::Max(2, [int]$Script:Cfg.OpenCodeStopSec))
+        $graceSec = [Math]::Max(2, [int]$Script:Cfg.OpenCodeStopSec)
+        if ($Fast) { $graceSec = [Math]::Min(4, $graceSec) }
+        $deadline = (Get-Date).AddSeconds($graceSec)
         while ((Get-Date) -lt $deadline) {
             Start-Sleep -Milliseconds 500
             if (-not @(Get-OpenCodeLeftover).Count) {
@@ -1690,25 +1906,50 @@ function Mark-Used([pscustomobject]$srv) {
     Save-State
 }
 
+function Get-SwitchCooldownSec {
+    # If another failure arrives soon after a switch, do not wait the full
+    # two-minute cooldown; a consecutive timeout needs a fast next attempt.
+    $normal = [int]$CooldownSec
+    try {
+        if ($global:LastFailover) {
+            $age = ((Get-Date) - $global:LastFailover).TotalSeconds
+            if ($age -ge 0 -and $age -lt [int]$Script:Cfg.ConsecutiveWindowSec) {
+                return [int]$Script:Cfg.FastRetrySec
+            }
+        }
+    } catch { }
+    return $normal
+}
+
 function Invoke-Failover {
-    param([string]$Reason = 'auto')
+    param([string]$Reason = 'auto', [switch]$Fast)
     Load-State
     $global:LastFailover = Get-Date
     $cur = Get-ActiveServer
     if ($cur) {
+        if ($Reason -eq 'quota') {
+            Add-AutoBannedServer (Get-ServerKey $cur) 'free usage limit' | Out-Null
+        }
         Invoke-FailoverReason-Log $Reason $cur
         Mark-Used $cur
     } else {
         Log ('cannot read current Happ server - proceeding with failover (' + $Reason + ')')
     }
-    $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
-    Log ("affected sessions: " + (($affected | ForEach-Object { $_.id }) -join ', '))
+    if ($Fast) {
+        # The pre-switch API scan can take seconds per session and is repeated
+        # by the post-reload pass anyway.
+        $affected = @()
+        Log 'fast failover: deferring affected-session scan until after the switch'
+    } else {
+        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
+        Log ("affected sessions: " + (($affected | ForEach-Object { $_.id }) -join ', '))
+    }
 
     # A live desktop app keeps HTTP/SSE connections pinned to the old core.
     # Stop it before the server changes and start it again once the switch is done.
     $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
     if ($Script:Cfg.RestartOpenCode -and $desktopWasRunning) {
-        if (-not (Stop-OpencodeDesktop)) {
+        if (-not (Stop-OpencodeDesktop -Fast:$Fast)) {
             Log 'opencode desktop could not be stopped - aborting the switch'
             return
         }
@@ -1717,9 +1958,12 @@ function Invoke-Failover {
     $switched = $false
     $rotated = $false
     $appReady = $true
+    $cacheFiles = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
+    if (-not $Fast -or $cacheFiles.Count -eq 0) {
+        Update-ConfigCache | Out-Null
+    }
     try {
         for ($attempt = 1; $attempt -le $Script:Cfg.MaxSwitchAttempts -and -not $switched; $attempt++) {
-            Update-ConfigCache | Out-Null
             $curKey = $null
             if ($cur) { $curKey = Get-ServerKey $cur }
             $cached = @(Get-CachedServerList)
@@ -1774,7 +2018,7 @@ function Invoke-Failover {
             }
 
             foreach ($cand in $candidates) {
-                if (Invoke-PipeSwitch -Target $cand) {
+                if (Invoke-PipeSwitch -Target $cand -Fast:$Fast) {
                     Mark-Used $cand
                     $switched = $true
                     break
@@ -1804,9 +2048,11 @@ function Invoke-Failover {
         return
     }
 
-    if ($Script:Cfg.ContinueDelaySec -gt 0) {
-        Log ("waiting {0}s for the provider to settle before continue prompts..." -f $Script:Cfg.ContinueDelaySec)
-        Start-Sleep -Seconds $Script:Cfg.ContinueDelaySec
+    $settleSec = [int]$Script:Cfg.ContinueDelaySec
+    if ($Fast -and $settleSec -gt 1) { $settleSec = 1 }
+    if ($settleSec -gt 0) {
+        Log ("waiting {0}s for the provider to settle before continue prompts..." -f $settleSec)
+        Start-Sleep -Seconds $settleSec
     }
 
     $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
@@ -1836,6 +2082,7 @@ function Test-OpLogTail {
     $lines = Get-Content $Script:Cfg.OpLogPath -Tail 300 -ErrorAction SilentlyContinue
     $windowStart = $global:LastFailover.AddSeconds(15)
     $rateNewest = $null
+    $quotaNewest = $null
     $endNewest = $null
     foreach ($l in $lines) {
         $ts = $null
@@ -1845,11 +2092,12 @@ function Test-OpLogTail {
         if (-not $ts) { continue }
         if ($l -match $Script:Cfg.RateLimitPattern) {
             if ($ts -gt $rateNewest) { $rateNewest = $ts }
+            if ($l -match $Script:Cfg.QuotaBanPattern -and $ts -gt $quotaNewest) { $quotaNewest = $ts }
         } elseif ($l -match $Script:Cfg.EndpointPattern) {
             if ($ts -gt $endNewest) { $endNewest = $ts }
         }
     }
-    return @{ rate = $rateNewest; endpoint = $endNewest }
+    return @{ rate = $rateNewest; quota = $quotaNewest; endpoint = $endNewest }
 }
 
 # ------- connection-loss burst detection (API-based) ------------------------
@@ -1925,6 +2173,7 @@ function Invoke-FailoverReason-Log([string]$reason, [pscustomobject]$cur) {
     $label = Format-ServerLabel $cur
     switch ($reason) {
         'auto' { Log ("rate limit detected; current server {0}" -f $label) }
+        'quota' { Log ("free usage limit reached; current server {0} auto-banned and marked used" -f $label) }
         'manual' { Log ("manual switch requested; current server {0} marked used" -f $label) }
         'manual-ban' { Log ("manual ban requested; leaving current server {0} and marking it used" -f $label) }
         'connreset-burst' { Log ("connection-loss burst (ECONNRESET); current server {0} marked used" -f $label) }
@@ -1957,9 +2206,9 @@ function Handle-Endpoint {
         Log 'no sessions currently stuck on endpoint errors'
     }
     if ($Script:Soft.rounds -ge 2) {
-        Log ("endpoint errors persist after {0} same-server continue tries - switching server" -f $Script:Soft.rounds)
+        Log ("endpoint errors persist after {0} same-server continue tries - fast switching server" -f $Script:Soft.rounds)
         $Script:Soft = New-SoftState
-        Invoke-Failover -Reason 'endpoint-persist'
+        Invoke-Failover -Reason 'endpoint-persist' -Fast
     } else {
         $Script:Soft.nextAt = $now.AddSeconds(60)
         Log 'next same-server continue retry scheduled in ~60s'
@@ -1974,7 +2223,11 @@ if ($ListBanned -or $BanServer -or $UnbanServer) {
         if (-not $bans.Count) {
             Log 'banned servers: (none)'
         } else {
-            foreach ($p in $bans) { Log ("banned server: {0} (since {1})" -f $p.Name, $p.Value) }
+            foreach ($p in $bans) {
+                $bi = Get-BanInfo $p.Value
+                $suffix = $(if ($bi.auto) { 'AUTO ' + $bi.reason } else { 'manual' })
+                Log ("banned server: {0} (since {1}; {2})" -f $p.Name, $bi.at, $suffix)
+            }
         }
     }
     if ($BanServer) {
@@ -2361,7 +2614,8 @@ function Get-AllKnownServers {
     foreach ($rec in $map.Values) {
         $names = @($rec.names | Where-Object { $_ })
         if (-not $names.Count) { $names = @('') }
-        $banned = Test-ServerBanned $rec.key
+        $banInfo = Get-ServerBanInfo $rec.key
+        $banned = [bool]$banInfo
         $used = $false
         try { $used = [bool]$Script:State.used.PSObject.Properties[$rec.key] } catch { }
         $current = ($rec.key -eq $curKey)
@@ -2388,6 +2642,12 @@ function Get-AllKnownServers {
                 isAlias    = ($i -gt 0 -or $rowIsProfile)
                 isProfile  = $rowIsProfile
                 banned     = $banned
+                banAuto    = $(if ($banInfo) { [bool]$banInfo.auto } else { $false })
+                banKind    = $(if ($banInfo) { [string]$banInfo.kind } else { '' })
+                banReason  = $(if ($banInfo) { [string]$banInfo.reason } else { '' })
+                banSince   = $(if ($banInfo) { [string]$banInfo.at } else { '' })
+                banSource  = $(if ($banInfo) { [string]$banInfo.source } else { '' })
+                banWildcard = $(if ($banInfo) { [bool]$banInfo.wildcard } else { $false })
                 current    = $current
                 used       = $used
                 sortBanned = $(if ($banned) { 0 } else { 1 })
@@ -2469,7 +2729,14 @@ function Reorder-BansEditor {
         if (-not $selectedKey) { $selectedKey = [string]$old[$idx].key }
     }
     foreach ($item in $old) {
-        $item.banned = Test-ServerBanned $item.key
+        $bi = Get-ServerBanInfo $item.key
+        $item.banned = [bool]$bi
+        $item.banAuto = $(if ($bi) { [bool]$bi.auto } else { $false })
+        $item.banKind = $(if ($bi) { [string]$bi.kind } else { '' })
+        $item.banReason = $(if ($bi) { [string]$bi.reason } else { '' })
+        $item.banSince = $(if ($bi) { [string]$bi.at } else { '' })
+        $item.banSource = $(if ($bi) { [string]$bi.source } else { '' })
+        $item.banWildcard = $(if ($bi) { [bool]$bi.wildcard } else { $false })
         $item.sortBanned = $(if ($item.banned) { 0 } else { 1 })
     }
     $items = @($old | Sort-Object sortBanned, sortName, key, uid)
@@ -2498,12 +2765,15 @@ function Toggle-BansEditorSelection {
     $Script:SuppressRender = $true
     try {
         if ($item.banned) {
+            $hadExact = [bool]$Script:Bans.PSObject.Properties[$item.key]
             Remove-BannedServer $item.key | Out-Null
-            # A profile can also be covered by an old endpoint-wide ban.
-            # If removing the profile entry did not clear it, clear the wildcard.
+            # A profile can also be covered by an old endpoint-wide ban. If the
+            # row had no exact entry, Enter is meant to clear that wildcard. If
+            # it did have an exact auto/manual entry, leave the endpoint's own
+            # ban alone; the row will simply remain covered by it.
             $wildcardKey = ''
             if ([string]$item.key -match '^(.+:[0-9]{1,5})#[0-9a-fA-F]+$') { $wildcardKey = $Matches[1] }
-            if ($wildcardKey -and (Test-ServerBanned $item.key)) {
+            if (-not $hadExact -and $wildcardKey -and (Test-ServerBanned $item.key)) {
                 Remove-BannedServer $wildcardKey | Out-Null
             }
         } else {
@@ -2602,6 +2872,7 @@ function Render-BansEditor {
         }
         $bannedCount = $bannedKeys.Count
         $endpointCount = $endpointKeys.Count
+        $autoBannedCount = @($items | Where-Object { $_.banned -and $_.banAuto } | ForEach-Object { $_.key } | Sort-Object -Unique).Count
 
         $hdrRows = 3
         $ftrRows = 1
@@ -2618,7 +2889,7 @@ function Render-BansEditor {
 
         $rows = New-Object System.Collections.Generic.List[object]
         $rows.Add([pscustomobject]@{
-            Text = ('BANS/SERVERS   {0} rows / {1} endpoints   banned {2}   {3}-{4}   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $count, $endpointCount, $bannedCount, $first, $last)
+            Text = ('BANS/SERVERS   {0} rows / {1} endpoints   banned {2} ({5} auto)   {3}-{4}   red=manual  orange=quota   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $count, $endpointCount, $bannedCount, $first, $last, $autoBannedCount)
             Fg   = [ConsoleColor]::Cyan
             Bg   = [ConsoleColor]::Black
         })
@@ -2636,7 +2907,7 @@ function Render-BansEditor {
         for ($i = $offset; $i -lt $last; $i++) {
             $item = $items[$i]
             $selected = ($i -eq $idx)
-            $status = $(if ($item.banned) { '[BANNED]' } else { '[  ok  ]' })
+            $status = $(if ($item.banned -and $item.banAuto) { '[AUTO]' } elseif ($item.banned) { '[BANNED]' } else { '[  ok  ]' })
             $selMark = $(if ($selected) { '>' } else { ' ' })
             $curMark = $(if ($item.current) { '*' } else { ' ' })
             $usedMark = $(if ($item.used) { 'used' } else { '    ' })
@@ -2651,10 +2922,14 @@ function Render-BansEditor {
                 else { $name = $name.Substring(0, $avail - 3) + '...' }
             }
             $text = $prefix + $name.PadRight($avail) + $suffix
-            if ($selected -and $item.banned) {
+            if ($selected -and $item.banned -and $item.banAuto) {
+                $fg = [ConsoleColor]::Black; $bg = [ConsoleColor]::DarkYellow
+            } elseif ($selected -and $item.banned) {
                 $fg = [ConsoleColor]::White; $bg = [ConsoleColor]::DarkRed
             } elseif ($selected) {
                 $fg = [ConsoleColor]::Black; $bg = [ConsoleColor]::Cyan
+            } elseif ($item.banned -and $item.banAuto) {
+                $fg = [ConsoleColor]::DarkYellow; $bg = [ConsoleColor]::Black
             } elseif ($item.banned) {
                 $fg = [ConsoleColor]::Red; $bg = [ConsoleColor]::Black
             } elseif ($item.current) {
@@ -2680,14 +2955,15 @@ function Render-BansEditor {
             $sel = $items[$idx]
             $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
             $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
+            $banNote = $(if ($sel.banned -and $sel.banAuto) { 'AUTO quota ban' } elseif ($sel.banned) { 'manual ban' } else { 'not banned' })
             if ($sel.isProfile) {
                 $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(endpoint)' })
-                $footer = ('Profile: {0}  ({1}) = same host:port as {2}; ban is profile-specific unless the endpoint is banned   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $action)
+                $footer = ('Profile: {0}  ({1}) = same host:port as {2}; {3}; {4}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $banNote, $action)
             } elseif ($sel.isAlias) {
                 $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(primary)' })
-                $footer = ('Alias: {0}  ({1}) = same endpoint as {2}; {3} affects the shared endpoint   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $action)
+                $footer = ('Alias: {0}  ({1}) = same endpoint as {2}; {3}; {4} affects the shared endpoint   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $banNote, $action)
             } else {
-                $footer = ('Selected: {0}  ({1})   {2}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $action)
+                $footer = ('Selected: {0}  ({1})   {2}; {3}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $banNote, $action)
             }
         }
         $rows.Add([pscustomobject]@{ Text = $footer; Fg = [ConsoleColor]::Cyan; Bg = [ConsoleColor]::Black })
@@ -2812,6 +3088,17 @@ if ($Watch) {
             }
         }
     }
+    if ($Interactive) {
+        # The alias map is the only expensive part of opening the bans editor
+        # (PowerShell JSON parsing of every captured config). Build it once now,
+        # before keystrokes are accepted, so [L] opens instantly.
+        try {
+            $warm = [Diagnostics.Stopwatch]::StartNew()
+            Get-CachedServerAliasMap | Out-Null
+            $warm.Stop()
+            Log ("server-name index warmed in {0} ms" -f [int]$warm.Elapsed.TotalMilliseconds)
+        } catch { }
+    }
     if ($Interactive -and $Script:LayoutReady) { Render-Frame }
     try { $host.UI.RawUI.WindowTitle = 'Happ Failover Watchdog' } catch { }
     while ($true) {
@@ -2819,11 +3106,20 @@ if ($Watch) {
             Load-Bans
             $fails = Test-OpLogTail
             $now = Get-Date
-            # rate limits take priority: full server failover
-            if ($fails.rate -and $fails.rate -gt $global:LastFailover.AddSeconds(15)) {
-                if ($now -gt $global:LastFailover.AddSeconds($CooldownSec)) {
-                    Log 'rate limit detected in opencode log - failover starting'
-                    Invoke-Failover
+            # rate limits take priority: full server failover. Compare against the
+            # failover start, not a fixed 15s margin; otherwise a quota error
+            # arriving seconds after a switch could be ignored forever.
+            if ($fails.rate -and $fails.rate -gt $global:LastFailover) {
+                $quotaError = ($fails.quota -and $fails.rate -and $fails.quota -ge $fails.rate)
+                $switchCool = Get-SwitchCooldownSec
+                if ($quotaError -or $now -gt $global:LastFailover.AddSeconds($switchCool)) {
+                    if ($quotaError) {
+                        Log 'free usage limit detected in opencode log - auto-banning current server and switching now'
+                        Invoke-Failover -Reason 'quota' -Fast
+                    } else {
+                        Log 'rate limit detected in opencode log - fast failover starting'
+                        Invoke-Failover -Reason 'auto' -Fast
+                    }
                 }
             }
             # endpoint-unavailable: soft path (continue retries on the same server first)
@@ -2841,11 +3137,11 @@ if ($Watch) {
                 $Script:ConnResetLast = Get-Date
                 $crCount = Test-ConnResetBurst
                 if ($crCount -ge $Script:Cfg.ConnResetMinCount) {
-                    if ((Get-Date) -gt $global:LastFailover.AddSeconds($CooldownSec)) {
-                        Log ("{0} connection-loss failures within {1}s - switching server" -f $crCount, $Script:Cfg.ConnResetWindowSec)
+                    if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
+                        Log ("{0} connection-loss failures within {1}s - fast switching server" -f $crCount, $Script:Cfg.ConnResetWindowSec)
                         Add-Member -InputObject $Script:State -NotePropertyName connResetUntil -NotePropertyValue ([string][DateTimeOffset]::Now.ToUnixTimeMilliseconds()) -Force
                         Save-State
-                        Invoke-Failover -Reason 'connreset-burst'
+                        Invoke-Failover -Reason 'connreset-burst' -Fast
                     } else {
                         Log ("{0} connection-loss failures detected but cooldown active - waiting" -f $crCount)
                     }
@@ -2884,10 +3180,10 @@ if ($Watch) {
                     $skipFailoverTick = $true
                 }
                 if (-not $skipFailoverTick -and $Script:DeadStreak -ge 2) {
-                    if ((Get-Date) -gt $global:LastFailover.AddSeconds($CooldownSec)) {
-                        Log ('network unreachable through the tunnel for ~' + ($Script:Cfg.TunnelScanSec * 2) + 's - switching server')
+                    if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
+                        Log ('network unreachable through the tunnel for ~' + ($Script:Cfg.TunnelScanSec * 2) + 's - fast switching server')
                         $Script:DeadStreak = 0
-                        Invoke-Failover -Reason 'tunnel-dead'
+                        Invoke-Failover -Reason 'tunnel-dead' -Fast
                     } else {
                         Log 'network unreachable but failover cooldown active - waiting'
                     }
