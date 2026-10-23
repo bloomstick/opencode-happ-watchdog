@@ -22,8 +22,8 @@ Capture sources
 3. Put the JSON files in a directory (default:
    ``%TEMP%\\opencode\\happ-capture``) and run this script.
 
-Only captures with exactly one vless/vmess/trojan server outbound are turned
-into profiles.  Multi-outbound group captures are skipped because they would
+Only captures with exactly one vless/vmess/trojan/hysteria server outbound are
+turned into profiles.  Multi-outbound group captures are skipped because they would
 duplicate the same group name across several endpoints; the watchdog's normal
 alias import still records their display names.
 
@@ -39,7 +39,7 @@ import json
 import os
 import tempfile
 
-SERVER_PROTOS = ("vless", "vmess", "trojan")
+SERVER_PROTOS = ("vless", "vmess", "trojan", "hysteria")
 HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_CAPTURES = os.path.join(os.environ.get("TEMP", "."), "opencode", "happ-capture")
 DEFAULT_CACHE = os.path.join(HERE, "configs")
@@ -79,6 +79,14 @@ def endpoints(outbound):
             and usable_host(vnext.get("address"))
         ):
             result.append((str(vnext["address"]), int(vnext["port"])))
+    if (
+        not result
+        and outbound.get("protocol") == "hysteria"
+        and settings.get("address")
+        and settings.get("port")
+        and usable_host(settings.get("address"))
+    ):
+        result.append((str(settings["address"]), int(settings["port"])))
     return result
 
 

@@ -702,13 +702,19 @@ function Update-ConfigCache {
         foreach ($o in (Get-JsonConfigFromText $text)) {
             Repair-CacheConfigKeys $o
             foreach ($ob in @($o.outbounds)) {
-                if ($ob.protocol -notin @('vless','hysteria','vmess','trojan') -or -not $ob.settings -or -not $ob.settings.vnext -or -not $ob.settings.vnext[0]) { continue }
+                if ($ob.protocol -notin @('vless','hysteria','vmess','trojan') -or -not $ob.settings) { continue }
                 $addr = ''
                 $port = 0
                 try {
-                    $addr = [string]$ob.settings.vnext[0].address
-                    $port = [int]$ob.settings.vnext[0].port
+                    if ($ob.settings.vnext -and $ob.settings.vnext[0]) {
+                        $addr = [string]$ob.settings.vnext[0].address
+                        $port = [int]$ob.settings.vnext[0].port
+                    } elseif ($ob.protocol -eq 'hysteria' -and $ob.settings.address) {
+                        $addr = [string]$ob.settings.address
+                        $port = [int]$ob.settings.port
+                    }
                 } catch { }
+                if ($addr -in @('0.0.0.0','::','localhost','auto-wifi.local') -or $addr -like '127.*') { continue }
                 if (-not $addr -or $port -lt 1 -or $port -gt 65535) {
                     Log ("cache skip: captured config has no usable address (remarks '" + ([string]$o.remarks) + "')")
                     continue
@@ -930,9 +936,12 @@ function Get-CachedOutbound {
         $tpl = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
         Repair-CacheConfigKeys $tpl
         foreach ($ob in $tpl.outbounds) {
-            if ($ob.protocol -in @('vless','hysteria','vmess','trojan') -and $ob.settings -and $ob.settings.vnext) {
+            if ($ob.protocol -notin @('vless','hysteria','vmess','trojan') -or -not $ob.settings) { continue }
+            if ($ob.settings.vnext -and $ob.settings.vnext[0]) {
                 $v = $ob.settings.vnext[0]
                 if ($v.address -eq $srvHost -and $v.port -eq $srvPort) { return $ob }
+            } elseif ($ob.protocol -eq 'hysteria' -and $ob.settings.address) {
+                if ([string]$ob.settings.address -eq $srvHost -and [int]$ob.settings.port -eq $srvPort) { return $ob }
             }
         }
     } catch { }
