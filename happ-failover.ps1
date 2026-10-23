@@ -85,7 +85,7 @@ $Script:Cfg = @{
     # provider request), tags the old one [burned], and prompts the fork.
     SessionForkEnabled = $true
     SessionForkMaxDepth = 6     # fork-of-fork chain cap for one root session
-    SessionForkMaxPerHour = 8   # safety valve against a switch/fork runaway
+    SessionForkMaxPerHour = 30  # safety valve against a switch/fork runaway
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
