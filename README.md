@@ -125,29 +125,87 @@ close (the daemon heartbeat continues).
 
 Happ sometimes exposes several names for the same `host:port` (or a memory capture is
 malformed). The editor lists those names as separate alias rows marked `~`; they share
-one cache template and one ban, so pressing `Enter` on any alias bans the endpoint for
-all of them. The cache is endpoint-keyed, so profiles with identical `host:port` cannot
-be selected independently. The editor is not a browser for the whole Happ subscription:
-only endpoints whose full xray config has been captured (or that are active, used, or
-banned) can appear.
+one cache template and one endpoint ban. Distinct credentials/transports that happen to
+use the same `host:port` are stored as **profile** rows marked `@`
+(`configs/<host>_<port>__<hash>.json`, key `host:port#hash`); they are independently
+selectable and bannable. An endpoint ban (`host:port`) remains a wildcard covering every
+profile on that endpoint; a profile ban (`host:port#hash`) affects only that profile.
+The header counts `host:port` endpoints separately from profile rows.
+
+The editor is not a browser for the whole Happ subscription: only endpoints/profiles
+whose full xray config has been captured (or that are active, used, or banned) can
+appear. See the capture workflow below to add missing servers.
+
+### Capturing all servers / duplicate endpoints
+
+Happ keeps generated xray configs in its GUI memory. The most reliable ways to expose
+them are:
+
+1. **Start the capture loop first.** Happ keeps probe configs only temporarily and may
+   free them as soon as the ping-all operation finishes, so do not wait until afterward
+   to scan:
+
+   ```powershell
+   # terminal A - persistent snapshot loop (writes each complete config immediately)
+   python capture-happ-memory.py --seconds 120 --interval 0.3
+   ```
+
+2. While that is running, open the Happ `...` menu and click **`Пинг всех`**. The
+   scanner polls Happ/xray memory and writes every full config it sees to
+   `captures/`; deduplication means repeated scans are safe. It cannot stop Happ from
+   unloading memory, but the files are already on disk, so unload no longer matters.
+3. Let it run for the full window (or until the process exits), then import the
+   snapshots:
+
+   ```powershell
+   python import-happ-profiles.py --captures captures --dry-run
+   python import-happ-profiles.py --captures captures
+   ```
+
+4. For a specific server that `Пинг всех` did not materialize, type its name in the
+   Happ search box, right-click the row, choose **`Копировать JSON`**, and save the
+   clipboard contents into `captures/`. This is the authoritative fallback and works
+   even when another profile already owns the same `host:port`.
+
+`R` in the watchdog is still useful for configs that are already in Happ's UTF-8
+memory; it imports new `host:port` cache files and name aliases. It is not a substitute
+for the capture loop when Happ has already discarded a transient probe config.
+
+The importer creates `configs/<host>_<port>__<hash>.json` for every captured
+single-server outbound whose credentials/transport differ from the endpoint's primary
+config. It never overwrites an existing cache file. Multi-outbound group captures are
+skipped because they represent a routing group rather than one server; their display
+name is still imported as a normal `~` alias by the watchdog's memory rescan.
+
+Two examples from a real subscription: India and Portugal share
+`185.147.27.235:443` with different UUIDs, and Kazakhstan, Italy, and Australia share
+`82.40.62.208:443`. Before profile support one name on each endpoint silently used the
+other's credentials. Now each has its own key and is independently selectable/bannable.
+
+Do not publish captured configs or `configs/*.json`: they contain connection
+credentials. The importer is safe to keep in the repository; the cache is not.
 
 ### Active server tracking
 
 The Happ registry only changes when the Happ GUI itself changes server; a pipe-based
-switch does not update it. The watchdog therefore records the real active endpoint in
-`state.json` and the dashboard shows **that** value. It only adopts the registry again
-when its `host:port` changes (meaning you selected another server in the Happ UI). The
-displayed server name is read from the cached config's `remarks` field. If both the
+switch does not update it. The watchdog therefore records the real active
+endpoint/profile in `state.json` and the dashboard shows **that** value. It adopts the
+registry again when its `host:port` **or profile name** changes (meaning you selected
+another server in the Happ UI), and resolves the name to a captured profile when one
+exists. This matters because two profiles can share `host:port` and differ only by name.
+The displayed server name is read from the cached config's `remarks` field. If both the
 state and the registry are blank (for example right after an upgrade), the watchdog
 identifies the server from the core's dominant established connection to a cached
-endpoint and records that once.
+endpoint and records that once (profile identity cannot be inferred from the socket
+alone, so it falls back to the endpoint).
 
 This is also why the dashboard can show a different server than the Happ window after a
 failover - the watchdog is right about the traffic path, and the GUI is still showing
 its stale selection until you reconnect there.
 
 New servers appear in the cache automatically as the Happ app generates their configs
-(observatory probes, selections), so the pool grows over time.
+(observatory probes, selections), so the pool grows over time. Use `Пинг всех` + `R`
+and the profile importer (above) to seed it more completely.
 
 ## Requirements
 
@@ -252,6 +310,14 @@ are command-line overrides for the loop.
 - `configs/*.json` - cached per-server xray config templates extracted from the Happ GUI
   process memory. **These contain your subscription's connection credentials - keep them
   private and never commit them.**
+- `configs/<host>_<port>__<hash>.json` - profile-keyed config for a distinct
+  credential/transport on a shared endpoint (also contains credentials; private).
+- `captures/` - persistent raw snapshots from `capture-happ-memory.py`; **credentials,
+  gitignored/private**.
+- `capture-happ-memory.py` - continuous Happ/xray memory scanner. Start it before
+  `Пинг всех`; it saves each complete config immediately so unloading cannot lose it.
+- `import-happ-profiles.py` - converts full captured Happ/xray JSON files into profile
+  cache entries; it skips groups and existing files and is safe to keep in the repo.
 
 ## Caveats
 
@@ -272,6 +338,10 @@ are command-line overrides for the loop.
 - Template extraction depends on the GUI holding the live config in memory; a Happ
   update that changes the memory layout can break the scanner. The protocol notes in
   [PROTOCOL.md](PROTOCOL.md) make diagnosing that tractable.
+- `Пинг всех` and targeted `Копировать JSON` are Happ UI actions; if Happ is not
+  running there is nothing to capture. The watchdog's `R` scanner reads xray-style UTF-8
+  configs; profile import reads the JSON files you captured. Some names exist only in
+  Happ's UTF-16 UI model, so targeted copy/paste is the authoritative fallback.
 - Only TUN mode with the xray core is wired up; proxy-only mode is not exercised by
   this tool.
 

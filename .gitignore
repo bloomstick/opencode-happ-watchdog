@@ -11,3 +11,10 @@ configs/
 # local helpers and shortcuts
 test-*.ps1
 *.lnk
+
+# raw memory captures - CONTAIN CREDENTIALS
+captures/
+
+# python cache
+__pycache__/
+*.pyc

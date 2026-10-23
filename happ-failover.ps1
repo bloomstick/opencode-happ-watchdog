@@ -134,7 +134,7 @@ function Initialize-StateMaps {
 }
 function Load-State {
     if (Test-Path $Script:Cfg.StatePath) {
-        try { $Script:State = Get-Content $Script:Cfg.StatePath -Raw | ConvertFrom-Json } catch { $Script:State = $null }
+        try { $Script:State = Get-Content $Script:Cfg.StatePath -Raw -Encoding utf8 | ConvertFrom-Json } catch { $Script:State = $null }
     }
     if ($null -eq $Script:State) { $Script:State = New-Object PSObject }
     if (Initialize-StateMaps) { Save-State }
@@ -152,7 +152,7 @@ function Load-Bans {
     $map = $null
     if (Test-Path $Script:Cfg.BansPath) {
         try {
-            $text = Get-Content $Script:Cfg.BansPath -Raw
+            $text = Get-Content $Script:Cfg.BansPath -Raw -Encoding utf8
             if (-not [string]::IsNullOrWhiteSpace($text)) {
                 $raw = $text | ConvertFrom-Json
                 if ($raw -is [array]) { Log 'bans file is not a JSON object - keeping the current ban list' }
@@ -180,13 +180,24 @@ function Save-Bans {
 }
 function Get-ServerKey([object]$srv) {
     if (-not $srv -or -not $srv.host) { return $null }
+    # A profile-aware server carries its own key (host:port#profileHash).
+    # Endpoint-only objects fall back to host:port.
+    try {
+        if ($srv.PSObject.Properties['key'] -and $srv.key) { return [string]$srv.key }
+    } catch { }
     return ('{0}:{1}' -f $srv.host, $srv.port)
 }
 function Test-ServerBanned([string]$key) {
     if (-not $key) { return $false }
     if (-not $Script:Bans) { Load-Bans }
     if (-not $Script:Bans) { return $false }
-    return [bool]$Script:Bans.PSObject.Properties[$key]
+    if ([bool]$Script:Bans.PSObject.Properties[$key]) { return $true }
+    # An endpoint ban is a wildcard: it also covers every profile on that
+    # endpoint, so bans created before profile capture stay effective.
+    if ($key -match '^(.+:[0-9]{1,5})#[0-9a-fA-F]+$') {
+        return [bool]$Script:Bans.PSObject.Properties[$Matches[1]]
+    }
+    return $false
 }
 function Get-BannedEntries {
     if (-not $Script:Bans) { Load-Bans }
@@ -224,6 +235,11 @@ function Resolve-ServerKey([string]$value) {
         $cur = Get-ActiveServer
         if (-not $cur) { return $null }
         return (Get-ServerKey $cur)
+    }
+    if ($value -match '^(.+):([0-9]{1,5})#([0-9a-fA-F]+)$') {
+        $port = [int]$Matches[2]
+        if ($port -ge 1 -and $port -le 65535) { return ('{0}:{1}#{2}' -f $Matches[1].Trim(), $port, $Matches[3].ToLowerInvariant()) }
+        return $null
     }
     if ($value -match '^(.+):([0-9]{1,5})$') {
         $port = [int]$Matches[2]
@@ -267,14 +283,15 @@ function Format-ServerLabel([object]$srv) {
 
 function New-ActiveRecord([object]$srv, [string]$source) {
     $name = ''
+    $key = Get-ServerKey $srv
     try { if ($srv.PSObject.Properties['name']) { $name = [string]$srv.name } } catch { }
-    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) }
+    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) $key }
     $name = $name.Trim()
     return [pscustomobject]@{
         host   = [string]$srv.host
         port   = [int]$srv.port
         name   = $name
-        key    = (Get-ServerKey $srv)
+        key    = $key
         since  = (Get-Date -Format 'o')
         source = $source
     }
@@ -293,7 +310,15 @@ function Get-ActiveServer {
     $regChanged = $false
     if ($reg -and $reg.host) {
         $regKey = Get-ServerKey $reg
-        if ($seen -and $seen.host -and ((Get-ServerKey $seen) -ne $regKey)) { $regChanged = $true }
+        if ($seen -and $seen.host) {
+            $seenKey = Get-ServerKey $seen
+            $identityChanged = ($seenKey -ne $regKey)
+            # A profile switch can keep host:port identical but change the name.
+            $nameChanged = ([string]$seen.name -ne '' -and [string]$reg.name -ne '' -and
+                            [string]$seen.name -ne [string]$reg.name)
+            $guidChanged = ([string]$seen.guid -ne [string]$reg.guid)
+            if ($identityChanged -or $nameChanged -or $guidChanged) { $regChanged = $true }
+        }
     }
 
     $changed = $false
@@ -311,7 +336,12 @@ function Get-ActiveServer {
         }
     }
     if ($reg -and $reg.host -and (-not $active -or ($regChanged -and -not $adoptedLive))) {
-        $active = New-ActiveRecord $reg 'registry'
+        # If the registry name matches a captured profile (e.g. a country on
+        # the same endpoint as another server), preserve that profile identity.
+        $regTarget = $reg
+        $profile = Find-CachedProfileForEndpoint ([string]$reg.host) ([int]$reg.port) ([string]$reg.name)
+        if ($profile) { $regTarget = $profile }
+        $active = New-ActiveRecord $regTarget 'registry'
         $changed = $true
     }
 
@@ -347,7 +377,7 @@ function Set-ActiveServer([object]$srv) {
     $key = Get-ServerKey $srv
     $name = ''
     try { if ($srv.PSObject.Properties['name']) { $name = [string]$srv.name } } catch { }
-    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) }
+    if (-not $name) { $name = Get-CachedServerName ([string]$srv.host) ([int]$srv.port) $key }
     if (-not $name) {
         try {
             if ($Script:State.active -and (Get-ServerKey $Script:State.active) -eq $key) {
@@ -703,9 +733,60 @@ function Update-ConfigCache {
 }
 
 function Get-ServerFromCacheKey([string]$key) {
+    # Profile files are <host>_<port>__<hash>.json. They represent a distinct
+    # credential/transport profile that can share host:port with another server.
+    if ($key -match '^(.+)_([0-9]{1,5})__([0-9a-fA-F]+)$') {
+        $port = 0
+        if (-not [int]::TryParse($Matches[2], [ref]$port)) { return $null }
+        if ($port -lt 1 -or $port -gt 65535) { return $null }
+        $hostName = $Matches[1]
+        $hash = $Matches[3].ToLowerInvariant()
+        return [pscustomobject]@{
+            host        = $hostName
+            port        = $port
+            key         = ('{0}:{1}#{2}' -f $hostName, $port, $hash)
+            profileHash = $hash
+        }
+    }
     $li = $key.LastIndexOf('_')
     if ($li -lt 1) { return $null }
-    return [pscustomobject]@{ host = $key.Substring(0, $li); port = [int]$key.Substring($li + 1) }
+    $hostName = $key.Substring(0, $li)
+    $port = 0
+    if (-not [int]::TryParse($key.Substring($li + 1), [ref]$port)) { return $null }
+    if ($port -lt 1 -or $port -gt 65535) { return $null }
+    return [pscustomobject]@{
+        host        = $hostName
+        port        = $port
+        key         = ('{0}:{1}' -f $hostName, $port)
+        profileHash = ''
+    }
+}
+
+function Get-CachedConfigPath([string]$srvHost, [int]$srvPort, [string]$Key = '') {
+    $hash = ''
+    if ($Key -and ($Key -match '#([0-9a-fA-F]+)$')) { $hash = $Matches[1].ToLowerInvariant() }
+    if ($hash) {
+        return (Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}__{2}.json" -f $srvHost, $srvPort, $hash))
+    }
+    return (Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort))
+}
+
+function Find-CachedProfileForEndpoint([string]$srvHost, [int]$srvPort, [string]$Name) {
+    if (-not $srvHost -or $srvPort -lt 1 -or $srvPort -gt 65535) { return $null }
+    $wanted = ([string]$Name).Trim()
+    if (-not $wanted) { return $null }
+    $pattern = ('{0}_{1}__*.json' -f $srvHost, $srvPort)
+    foreach ($f in @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter $pattern -File -ErrorAction SilentlyContinue)) {
+        try {
+            $cfg = Get-Content $f.FullName -Raw -Encoding utf8 | ConvertFrom-Json
+            Repair-CacheConfigKeys $cfg
+            $remarks = ([string]$cfg.remarks).Trim()
+            if ($remarks -and $remarks -ieq $wanted) {
+                return (Get-ServerFromCacheKey $f.BaseName)
+            }
+        } catch { }
+    }
+    return $null
 }
 
 function Get-CachedServerList {
@@ -842,11 +923,11 @@ function Optimize-CandidateOrder {
 }
 
 function Get-CachedOutbound {
-    param([string]$srvHost, [int]$srvPort)
-    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort)
+    param([string]$srvHost, [int]$srvPort, [string]$ProfileKey = '')
+    $file = Get-CachedConfigPath $srvHost $srvPort $ProfileKey
     if (-not (Test-Path $file)) { return $null }
     try {
-        $tpl = Get-Content $file -Raw | ConvertFrom-Json
+        $tpl = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
         Repair-CacheConfigKeys $tpl
         foreach ($ob in $tpl.outbounds) {
             if ($ob.protocol -in @('vless','hysteria','vmess','trojan') -and $ob.settings -and $ob.settings.vnext) {
@@ -858,11 +939,17 @@ function Get-CachedOutbound {
     return $null
 }
 
-function Get-CachedServerName([string]$srvHost, [int]$srvPort) {
-    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $srvHost, $srvPort)
-    if (-not (Test-Path $file)) { return '' }
+function Get-CachedServerName([string]$srvHost, [int]$srvPort, [string]$ProfileKey = '') {
+    $file = Get-CachedConfigPath $srvHost $srvPort $ProfileKey
+    if (-not (Test-Path $file)) {
+        if ($ProfileKey -and $ProfileKey -match '#') {
+            # Keep the endpoint label as a fallback if a profile file vanished.
+            $file = Get-CachedConfigPath $srvHost $srvPort
+        }
+        if (-not (Test-Path $file)) { return '' }
+    }
     try {
-        $cfg = Get-Content $file -Raw | ConvertFrom-Json
+        $cfg = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
         if ($cfg.remarks) { return ([string]$cfg.remarks).Trim() }
     } catch { }
     return ''
@@ -924,9 +1011,10 @@ function Get-CachedServerAliasMap {
     $map = @{}
     $files = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
     foreach ($f in $files) {
+        if ($f.BaseName -match '__[0-9a-fA-F]+$') { continue }
         if ($f.BaseName -notmatch '^(.+)_(\d+)$') { continue }
         $key = $Matches[1] + ':' + $Matches[2]
-        try { $cfg = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        try { $cfg = Get-Content $f.FullName -Raw -Encoding utf8 | ConvertFrom-Json } catch { continue }
         Repair-CacheConfigKeys $cfg
         if (-not $map.ContainsKey($key)) { $map[$key] = New-Object System.Collections.Generic.List[string] }
         $names = @()
@@ -937,8 +1025,9 @@ function Get-CachedServerAliasMap {
         }
     }
     foreach ($f in $files) {
+        if ($f.BaseName -match '__[0-9a-fA-F]+$') { continue }
         if ($f.BaseName -match '^(.+)_(\d+)$') { continue }
-        try { $cfg = Get-Content $f.FullName -Raw | ConvertFrom-Json } catch { continue }
+        try { $cfg = Get-Content $f.FullName -Raw -Encoding utf8 | ConvertFrom-Json } catch { continue }
         Repair-CacheConfigKeys $cfg
         $meta = Get-CachedConfigMeta $cfg
         if (-not $meta) { continue }
@@ -954,7 +1043,7 @@ function Add-CacheAlias([string]$file, [string]$name) {
     $name = ([string]$name).Trim()
     if (-not $file -or -not $name -or -not (Test-Path $file)) { return $false }
     try {
-        $cfg = Get-Content $file -Raw | ConvertFrom-Json
+        $cfg = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
         $primary = ''
         try { $primary = ([string]$cfg.remarks).Trim() } catch { }
         if ($name -eq $primary) { return $false }
@@ -1028,19 +1117,27 @@ function Get-CurrentTemplate {
     param([object]$Server)
     if (-not $Server) { $Server = Get-ActiveServer }
     if (-not $Server -or -not $Server.host) { Log 'cannot determine the active server'; return $null }
-    $file = Join-Path $Script:Cfg.ConfigCacheDir ("{0}_{1}.json" -f $Server.host, $Server.port)
+    $serverKey = Get-ServerKey $Server
+    $file = Get-CachedConfigPath ([string]$Server.host) ([int]$Server.port) $serverKey
+    if (-not (Test-Path $file) -and $serverKey -match '#') {
+        $file = Get-CachedConfigPath ([string]$Server.host) ([int]$Server.port)
+    }
     if (Test-Path $file) {
         try {
-            $tpl = Get-Content $file -Raw | ConvertFrom-Json
+            $tpl = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
             Repair-CacheConfigKeys $tpl
             return $tpl
         } catch { Log ("template parse failed: " + $_.Exception.Message) }
     }
     Log ("active server {0}_{1} not in cache; scanning GUI memory..." -f $Server.host, $Server.port)
     Update-ConfigCache | Out-Null
+    $file = Get-CachedConfigPath ([string]$Server.host) ([int]$Server.port) $serverKey
+    if (-not (Test-Path $file) -and $serverKey -match '#') {
+        $file = Get-CachedConfigPath ([string]$Server.host) ([int]$Server.port)
+    }
     if (Test-Path $file) {
         try {
-            $tpl = Get-Content $file -Raw | ConvertFrom-Json
+            $tpl = Get-Content $file -Raw -Encoding utf8 | ConvertFrom-Json
             Repair-CacheConfigKeys $tpl
             return $tpl
         } catch { }
@@ -1168,8 +1265,9 @@ function Start-CoreBurst {
 function Invoke-PipeSwitch {
     param([pscustomobject]$Target)
     Load-Bans
-    if (Test-ServerBanned (Get-ServerKey $Target)) {
-        Log ("refusing banned server {0}:{1}" -f $Target.host, $Target.port)
+    $targetKey = Get-ServerKey $Target
+    if (Test-ServerBanned $targetKey) {
+        Log ("refusing banned server {0}" -f $targetKey)
         return $false
     }
     $curSrv = Get-ActiveServer
@@ -1177,10 +1275,10 @@ function Invoke-PipeSwitch {
     if (-not $template) { return $false }
     $curBanned = $false
     if ($curSrv) { $curBanned = Test-ServerBanned (Get-ServerKey $curSrv) }
-    $newOut = Get-CachedOutbound -srvHost $Target.host -srvPort $Target.port
+    $newOut = Get-CachedOutbound -srvHost $Target.host -srvPort $Target.port -ProfileKey $targetKey
     if (-not $newOut) {
-        Log ("no cached outbound for {0}:{1}" -f $Target.host, $Target.port)
-        Update-Reliability (Get-ServerKey $Target) $false
+        Log ("no cached outbound for {0}" -f $targetKey)
+        Update-Reliability $targetKey $false
         return $false
     }
 
@@ -1485,7 +1583,8 @@ function Send-ContinueToSession {
 # ------------------------------------------------------------------- failover
 function Mark-Used([pscustomobject]$srv) {
     if (-not $srv -or -not $srv.host) { return }
-    $key = ('{0}:{1}' -f $srv.host, $srv.port)
+    $key = Get-ServerKey $srv
+    if (-not $key) { return }
     Add-Member -InputObject $Script:State.used -NotePropertyName $key -NotePropertyValue (Get-Date -Format 'o') -Force
     Save-State
 }
@@ -2047,27 +2146,48 @@ function Get-HeaderLines {
 # be found and removed even if its cache config has disappeared.
 function Get-ServerFromKey([string]$key) {
     if (-not $key) { return $null }
+    $key = $key.Trim()
+    if ($key -match '^(.+):([0-9]{1,5})#([0-9a-fA-F]+)$') {
+        $port = [int]$Matches[2]
+        if ($port -lt 1 -or $port -gt 65535) { return $null }
+        $hostName = $Matches[1]
+        $hash = $Matches[3].ToLowerInvariant()
+        return [pscustomobject]@{
+            host        = $hostName
+            port        = $port
+            key         = ('{0}:{1}#{2}' -f $hostName, $port, $hash)
+            profileHash = $hash
+        }
+    }
     $i = $key.LastIndexOf(':')
     if ($i -lt 1) { return $null }
     $port = 0
     if (-not [int]::TryParse($key.Substring($i + 1), [ref]$port)) { return $null }
     if ($port -lt 1 -or $port -gt 65535) { return $null }
-    return [pscustomobject]@{ host = $key.Substring(0, $i); port = $port }
+    $hostName = $key.Substring(0, $i)
+    return [pscustomobject]@{
+        host        = $hostName
+        port        = $port
+        key         = ('{0}:{1}' -f $hostName, $port)
+        profileHash = ''
+    }
 }
 
 function Get-AllKnownServers {
     if (-not $Script:State) { Load-State }
     $aliasMap = Get-CachedServerAliasMap
     $map = @{}
+    $profileNames = @{}
     $ensure = {
         param([string]$hostName, [int]$port, [string]$key)
         if (-not $key) { $key = '{0}:{1}' -f $hostName, $port }
         if (-not $map.ContainsKey($key)) {
             $map[$key] = [pscustomobject]@{
-                host  = [string]$hostName
-                port  = [int]$port
-                key   = [string]$key
-                names = (New-Object System.Collections.Generic.List[string])
+                host      = [string]$hostName
+                port      = [int]$port
+                key       = [string]$key
+                names     = (New-Object System.Collections.Generic.List[string])
+                isProfile = $false
             }
         }
         return $map[$key]
@@ -2076,7 +2196,13 @@ function Get-AllKnownServers {
     foreach ($srv in @(Get-CachedServerList)) {
         $key = Get-ServerKey $srv
         if (-not $key) { continue }
-        $null = & $ensure ([string]$srv.host) ([int]$srv.port) $key
+        $rec = & $ensure ([string]$srv.host) ([int]$srv.port) $key
+        if ($srv.PSObject.Properties['profileHash'] -and $srv.profileHash) {
+            $rec.isProfile = $true
+            $n = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port) $key)).Trim()
+            if ($n -and -not $rec.names.Contains($n)) { $rec.names.Add($n) }
+            if ($n) { $profileNames[('{0}:{1}|{2}' -f $srv.host, $srv.port, $n.ToLowerInvariant())] = $key }
+        }
     }
     # names captured for this endpoint (primary file + aliases + recovered
     # malformed captures such as a corrupted "_443.json")
@@ -2084,12 +2210,15 @@ function Get-AllKnownServers {
         if (-not $map.ContainsKey($key)) { continue }
         $rec = $map[$key]
         foreach ($n in @($aliasMap[$key])) {
-            if ($n -and -not $rec.names.Contains($n)) { $rec.names.Add($n) }
+            if (-not $n) { continue }
+            $profileLookup = ('{0}|{1}' -f $key, ([string]$n).ToLowerInvariant())
+            if ($profileNames.ContainsKey($profileLookup)) { continue }
+            if (-not $rec.names.Contains($n)) { $rec.names.Add($n) }
         }
     }
     foreach ($rec in @($map.Values)) {
         if ($rec.names.Count -eq 0) {
-            $n = ([string](Get-CachedServerName ([string]$rec.host) ([int]$rec.port))).Trim()
+            $n = ([string](Get-CachedServerName ([string]$rec.host) ([int]$rec.port) ([string]$rec.key))).Trim()
             if ($n) { $rec.names.Add($n) }
         }
     }
@@ -2099,8 +2228,9 @@ function Get-AllKnownServers {
         $aKey = Get-ServerKey $active
         if ($aKey) {
             $rec = & $ensure ([string]$active.host) ([int]$active.port) $aKey
+            if ($aKey -match '#') { $rec.isProfile = $true }
             $aName = ([string]$active.name).Trim()
-            if (-not $aName) { $aName = ([string](Get-CachedServerName ([string]$active.host) ([int]$active.port))).Trim() }
+            if (-not $aName) { $aName = ([string](Get-CachedServerName ([string]$active.host) ([int]$active.port) $aKey)).Trim() }
             if ($aName -and -not $rec.names.Contains($aName)) { $rec.names.Add($aName) }
         }
     }
@@ -2110,9 +2240,10 @@ function Get-AllKnownServers {
         if (-not $key) { return }
         $srv = Get-ServerFromKey $key
         if (-not $srv) { return }
-        $rec = & $ensure ([string]$srv.host) ([int]$srv.port) $key
+        $rec = & $ensure ([string]$srv.host) ([int]$srv.port) ([string]$srv.key)
+        if ([string]$srv.key -match '#') { $rec.isProfile = $true }
         if ($rec.names.Count -eq 0) {
-            $n = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port))).Trim()
+            $n = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port) ([string]$srv.key))).Trim()
             if ($n) { $rec.names.Add($n) }
         }
     }
@@ -2133,17 +2264,28 @@ function Get-AllKnownServers {
         $used = $false
         try { $used = [bool]$Script:State.used.PSObject.Properties[$rec.key] } catch { }
         $current = ($rec.key -eq $curKey)
+        $endpointKey = ('{0}:{1}' -f $rec.host, $rec.port)
+        $endpointPrimary = ''
+        if ($aliasMap.ContainsKey($endpointKey)) {
+            $epNames = @($aliasMap[$endpointKey])
+            if ($epNames.Count -gt 0) { $endpointPrimary = [string]$epNames[0] }
+        }
         for ($i = 0; $i -lt $names.Count; $i++) {
             $nm = [string]$names[$i]
             $primary = [string]$names[0]
+            $rowIsProfile = [bool]$rec.isProfile
+            $aliasOf = ''
+            if ($rowIsProfile) { $aliasOf = $endpointPrimary }
+            elseif ($i -gt 0) { $aliasOf = $primary }
             $rows.Add([pscustomobject]@{
                 host       = $rec.host
                 port       = [int]$rec.port
                 key        = $rec.key
                 uid        = ($rec.key + '#' + $nm + '#' + $i)
                 name       = $nm
-                aliasOf    = $(if ($i -gt 0) { $primary } else { '' })
-                isAlias    = ($i -gt 0)
+                aliasOf    = $aliasOf
+                isAlias    = ($i -gt 0 -or $rowIsProfile)
+                isProfile  = $rowIsProfile
                 banned     = $banned
                 current    = $current
                 used       = $used
@@ -2256,6 +2398,13 @@ function Toggle-BansEditorSelection {
     try {
         if ($item.banned) {
             Remove-BannedServer $item.key | Out-Null
+            # A profile can also be covered by an old endpoint-wide ban.
+            # If removing the profile entry did not clear it, clear the wildcard.
+            $wildcardKey = ''
+            if ([string]$item.key -match '^(.+:[0-9]{1,5})#[0-9a-fA-F]+$') { $wildcardKey = $Matches[1] }
+            if ($wildcardKey -and (Test-ServerBanned $item.key)) {
+                Remove-BannedServer $wildcardKey | Out-Null
+            }
         } else {
             Add-BannedServer $item.key 'bans editor' | Out-Null
         }
@@ -2345,7 +2494,9 @@ function Render-BansEditor {
         $bannedKeys = @{}
         $endpointKeys = @{}
         foreach ($it in $items) {
-            if ($it.key) { $endpointKeys[$it.key] = $true }
+            $epKey = [string]$it.key
+            if ($epKey -match '^(.+:[0-9]{1,5})#[0-9a-fA-F]+$') { $epKey = $Matches[1] }
+            if ($epKey) { $endpointKeys[$epKey] = $true }
             if ($it.banned -and $it.key) { $bannedKeys[$it.key] = $true }
         }
         $bannedCount = $bannedKeys.Count
@@ -2376,7 +2527,7 @@ function Render-BansEditor {
             Bg   = [ConsoleColor]::Black
         })
         $rows.Add([pscustomobject]@{
-            Text = '  STATE     CUR~ NAME                             HOST:PORT                 USED   (~ = same endpoint)'
+            Text = '  STATE     CUR@ NAME                             HOST:PORT                 USED   (~ alias, @ profile)'
             Fg   = [ConsoleColor]::DarkGray
             Bg   = [ConsoleColor]::Black
         })
@@ -2388,7 +2539,7 @@ function Render-BansEditor {
             $selMark = $(if ($selected) { '>' } else { ' ' })
             $curMark = $(if ($item.current) { '*' } else { ' ' })
             $usedMark = $(if ($item.used) { 'used' } else { '    ' })
-            $aliasMark = $(if ($item.isAlias) { '~' } else { ' ' })
+            $aliasMark = $(if ($item.isProfile) { '@' } elseif ($item.isAlias) { '~' } else { ' ' })
             $name = [string]$item.name
             if (-not $name) { $name = '(unnamed)' }
             $prefix = ('{0} {1} {2}{3} ' -f $selMark, $status, $curMark, $aliasMark)
@@ -2428,7 +2579,10 @@ function Render-BansEditor {
             $sel = $items[$idx]
             $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
             $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
-            if ($sel.isAlias) {
+            if ($sel.isProfile) {
+                $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(endpoint)' })
+                $footer = ('Profile: {0}  ({1}) = same host:port as {2}; ban is profile-specific unless the endpoint is banned   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $action)
+            } elseif ($sel.isAlias) {
                 $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(primary)' })
                 $footer = ('Alias: {0}  ({1}) = same endpoint as {2}; {3} affects the shared endpoint   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $action)
             } else {
