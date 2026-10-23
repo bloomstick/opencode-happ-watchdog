@@ -55,6 +55,10 @@ is never reused on the new exit IP.
    visible event is a provider failure. Subagent sessions are skipped; they get
    re-spawned by their parent flow. Sessions already prompted are skipped only while
    their failure predates the last prompt, so a *new* failure always re-flags them.
+5. **Captures the whole subscription on demand**: the dashboard's `U` button starts a
+   continuous memory scan, you click Happ -> `...` -> `Пинг всех`, and `U` again stops
+   the scan, imports the captured profiles, refreshes the cache, and makes every server
+   available for rotation. `-CaptureAll` does the same from the command line.
 
 State (active server, used servers, prompted sessions) is kept in `state.json`, so
 "previously unused" is tracked across watchdog restarts. Banned servers live in a
@@ -181,10 +185,46 @@ The editor is not a browser for the whole Happ subscription: only endpoints/prof
 whose full xray config has been captured (or that are active, used, or banned) can
 appear. See the capture workflow below to add missing servers.
 
-### Capturing all servers / duplicate endpoints
+### Continuous server update (`[U]` / `-CaptureAll`)
 
-Happ keeps generated xray configs in its GUI memory. The most reliable ways to expose
-them are:
+The dashboard now has a built-in update mode, so the capture workflow does not need a
+second terminal. The watchdog starts the memory scanner as a child process, tails its
+`CAPTURE` events into the dashboard log, and imports the snapshots when you stop it.
+
+1. In the watchdog dashboard, press **`U`**. The header changes to
+   `Capture: ON ...` and the event log says `continuous capture ON`.
+2. Immediately open the Happ `...` menu and click **`Пинг всех`**. The scanner is already
+   running; you do not have to race the first probe.
+3. Let the ping run. Every materialized config appears as a `[capture] CAPTURE ...`
+   event, and the file is written to `captures/` immediately.
+4. Press **`U`** again. The watchdog stops the scanner, imports new profiles, rescans
+   Happ memory for endpoint files and name aliases, and logs the refreshed cache count.
+   Press **`L`** to see the full server list, or run `-ListServers` (below).
+
+The tool cannot click `Пинг всех` for you: that is a Happ UI action and the daemon
+protocol has no equivalent. The button only guarantees that capture is running before
+the probes start and handles the import afterward.
+
+The same flow is available without the interactive dashboard:
+
+```powershell
+# start capture, wait 180s for you to run Ping all, import, print the server list
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -CaptureAll -CaptureSeconds 180
+
+# print the cached server list (endpoints + profiles, with active/used/banned tags)
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListServers
+```
+
+`[U]` uses `CaptureWindowSec` (default 1800s) as a safety limit; pressing `U` again
+stops earlier. `[U]` and `-CaptureAll` need Python 3 (`python` or `py -3`) because they
+run the bundled `capture-happ-memory.py` scanner. Without Python, `R` still rescans
+whatever configs are currently in Happ memory, but it cannot catch transient probe
+configs after Happ unloads them.
+
+### Manual capture (advanced)
+
+Happ keeps generated xray configs in its GUI memory. The underlying manual workflow is
+still useful for debugging or for a machine without Python integration:
 
 1. **Start the capture loop first.** Happ keeps probe configs only temporarily and may
    free them as soon as the ping-all operation finishes, so do not wait until afterward
@@ -272,6 +312,9 @@ and the profile importer (above) to seed it more completely.
   xray core; `core\xray.exe`, `tun\sing-box.exe`)
 - OpenCode with the background service and sessions in an OpenCode project (pass
   `-ProjectDir` or launch from the project directory)
+- Python 3 **optional** - required for the `[U]` continuous update mode and
+  `-CaptureAll` (the bundled `capture-happ-memory.py` / `import-happ-profiles.py`);
+  the watchdog itself and `R` rescans work without it
 - Elevation: OS-level killing of the GUI-owned core requires admin - the launcher
   self-elevates (one UAC prompt)
 
@@ -307,6 +350,7 @@ settle, re-applies the pinned buffer at the top-left, then redraws.
 | `B` | ban the current server and switch away from it immediately (manual ban = red) |
 | `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `R` rescans, `Esc`/`L` closes) |
 | `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure |
+| `U` | start/stop continuous server update; while it runs, click Happ -> `...` -> `Пинг всех`, then press `U` again to import and refresh the list |
 | `C` | clear the used-server list; bans are unchanged |
 | `Q` | quit (releases the owned core and tunnel; reconnect via the Happ GUI) |
 
