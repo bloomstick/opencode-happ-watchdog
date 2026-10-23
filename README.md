@@ -4,7 +4,8 @@ An autonomous recovery watchdog for [OpenCode](https://opencode.ai) running behi
 [Happ](https://happ.su) proxy client on Windows. When the provider misbehaves - rate
 limits, free-usage quota, dead connections, failed endpoints, a collapsed tunnel - the
 watchdog rotates Happ to a random unused server, fully restarts the OpenCode desktop
-app, and sends `continue` to every affected top-level session.
+app, and resumes every affected top-level session **in a fork** so the flagged session
+is never reused on the new exit IP.
 
 ```
 15:47:17 3 connection-loss failures within 180s - switching server
@@ -14,7 +15,8 @@ app, and sends `continue` to every affected top-level session.
 15:47:39 TUN adapter up: happ-default-tun (Up)
 15:47:41 SWITCH OK -> 203.0.113.129:443 (core exit IP: 203.0.113.129; system route: 203.0.113.129)
 15:47:42 opencode desktop healthy after 1s (pid 9828)
-15:47:49 continue -> ses_1111111111aa
+15:47:49 session ses_1111111111aa burned by rate errors - forked to ses_4444444444dd ...
+15:47:49 continue -> ses_4444444444dd
 15:47:49 failover complete
 ```
 
@@ -109,6 +111,20 @@ cycle 2**: the used-list resets (except the currently active server) and candida
 retried in **random order**. Banned servers are not part of this pool and are never
 re-introduced by a rotation reset. The event appears in the dashboard as
 `rotation reset: all N unbanned cached servers used - cycling again in random order`.
+
+### Session poisoning and automatic forks
+
+Provider quota flags follow a session, not only an exit IP: prompting a flagged session
+again from a freshly switched server can flag the new IP with its first request. After a
+switch the watchdog therefore **forks** every session it is about to resume
+(`POST /api/session/<id>/fork` - a local copy of the projected transcript, no provider
+request and no quota use), tags the old session `[burned]`, and sends `continue` to the
+fork. Burned sessions are never scanned or prompted again; their fork carries the work.
+
+If a fork is flagged later it is forked again. `SessionForkMaxDepth` (default 6) caps the
+chain per root session and `SessionForkMaxPerHour` (default 8) caps total forks to stop
+a switch/fork runaway. A deleted fork is recreated on the next resume. The mapping is
+kept in `state.json.sessions`; the dashboard shows a `burned` count.
 
 ### Bans
 
@@ -281,8 +297,8 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -Watch -Interactive
 ## Dashboard and hotkeys
 
 The dashboard shows live status: Happ GUI/core state, the active server, the number of
-eligible servers for the next random pick, cache/used/banned stats, last failover, and a
-rolling event log. Window resizes are debounced: the watchdog waits for the drag to
+eligible servers for the next random pick, cache/used/banned/burned stats, last failover,
+and a rolling event log. Window resizes are debounced: the watchdog waits for the drag to
 settle, re-applies the pinned buffer at the top-left, then redraws.
 
 | key | action |
@@ -308,6 +324,11 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -TestProbe
 
 # one manual random switch; verifies the new server but does not restart the app
 powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -TestSwitch
+
+# session recovery: fork by hand (burns the source), inspect, or clear the mapping
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ForkSession ses_...
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListBurned
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -UnburnSession ses_...
 ```
 
 ## Auto-start (optional)
@@ -340,6 +361,10 @@ Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptio
 - `OpenCodeExe`, `OpenCodeStopSec`, `OpenCodeStartSec` - desktop app path and timeouts
 - `BansPath` - persistent ban list, separate from `state.json` (default `bans.json`)
 - `TopLevelOnly` - skip subagent sessions when continuing (default `$true`)
+- `SessionForkEnabled` - fork a failed session before resuming it after a switch; the
+  source is tagged `[burned]` and never prompted again (default `$true`)
+- `SessionForkMaxDepth` / `SessionForkMaxPerHour` - fork-chain and total-per-hour caps
+  (defaults 6 / 8)
 - `MaxSwitchAttempts` - maximum candidate-selection passes per failover; each pass tries
   every eligible server in random order
 - `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern` - error classifiers
@@ -351,8 +376,8 @@ are command-line overrides for the loop.
 
 ## Files created at runtime (gitignored)
 
-- `state.json` - active server, used servers, prompted sessions, route/deadline markers,
-  exit IP history
+- `state.json` - active server, used servers, prompted sessions, session-to-fork burn
+  mappings, route/deadline markers, exit IP history
 - `bans.json` - permanently banned servers; never cleared by the used-list reset.
   Timestamp strings are manual (red); objects with `kind: auto` are quota bans (orange)
 - `failover.log` - rolling transcript of everything the watchdog does
@@ -375,6 +400,9 @@ are command-line overrides for the loop.
 - Every failover closes and relaunches the OpenCode desktop window. Run the watchdog
   from its desktop shortcut, not from a terminal inside OpenCode, otherwise the restart
   can take its own console down with the app.
+- After a failover the desktop app may reopen the burned session. The real continuation
+  is the fork whose title ends with `(fork #N)`; the burned original is tagged
+  `[burned]` and is never prompted by the watchdog again.
 - Stopping the GUI-owned core requires an OS-level kill (xray runs as SYSTEM), so either
   run the watchdog **elevated** (recommended) or accept one UAC prompt per switch.
 - After a watchdog switch the Happ GUI keeps displaying the old server (the app's state

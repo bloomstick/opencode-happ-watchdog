@@ -24,6 +24,9 @@
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -BanServer host:port
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnbanServer host:port
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBanned
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ForkSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBurned
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnburnSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -Watch [-Interactive] [-ProjectDir <dir>]
 #>
 param(
@@ -37,6 +40,9 @@ param(
     [string]$BanServer,
     [string]$UnbanServer,
     [switch]$ListBanned,
+    [string]$ForkSession,
+    [string]$UnburnSession,
+    [switch]$ListBurned,
     [int]$PollSeconds = 5,
     [int]$CooldownSec = 120,
     [string]$ProjectDir = ''
@@ -66,6 +72,14 @@ $Script:Cfg = @{
     ContinueDelaySec  = 5     # wait after app/service (re)connect before continue prompts
     RestartOpenCode   = $true
     TopLevelOnly      = $true
+    # A session that was in flight when a server switch happened must not be
+    # prompted again on the new exit IP: a session already flagged by the
+    # provider can flag the new IP with its first request. After a switch the
+    # watchdog forks every session it is about to resume (local DB copy, no
+    # provider request), tags the old one [burned], and prompts the fork.
+    SessionForkEnabled = $true
+    SessionForkMaxDepth = 6     # fork-of-fork chain cap for one root session
+    SessionForkMaxPerHour = 8   # safety valve against a switch/fork runaway
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
@@ -125,10 +139,22 @@ function Log([string]$msg) {
     try { $line | Out-File $Script:Cfg.LogPath -Append -Encoding utf8 } catch { }
 }
 
+function Add-RingEvent([string]$msg) {
+    # dashboard-only event (also useful before the interactive layout exists)
+    $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
+    try { $Script:EventRing.Add([string]$line) } catch { }
+    while ($Script:EventRing.Count -gt $Script:RingCap) {
+        try { $Script:EventRing.RemoveAt(0) } catch { break }
+    }
+    if ($Script:LayoutReady -and -not $Script:SuppressRender) {
+        try { if (Get-Command Render-Frame -ErrorAction SilentlyContinue) { Render-Frame } } catch { }
+    }
+}
+
 # ------------------------------------------------------------------- state
 function Initialize-StateMaps {
     $changed = $false
-    foreach ($name in @('used','prompted','reliability')) {
+    foreach ($name in @('used','prompted','reliability','sessions')) {
         $prop = $Script:State.PSObject.Properties[$name]
         if (-not $prop -or $null -eq $prop.Value) {
             Add-Member -InputObject $Script:State -NotePropertyName $name -NotePropertyValue (New-Object PSObject) -Force
@@ -1670,6 +1696,8 @@ function Get-FailedSessions {
     $result = @()
     foreach ($s in $root.data) {
         if ($Script:Cfg.TopLevelOnly -and $s.parentID) { continue }
+        # Burned sessions are never prompted again; their fork carries the work.
+        if (Test-SessionBurned $s.id) { continue }
         $updated = $null
         if ($s.time -and $s.time.updated) {
             try { $updated = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.time.updated).LocalDateTime } catch { }
@@ -1710,6 +1738,18 @@ function Get-FailedSessions {
             }
         }
         if (-not $errKind) { continue }
+        # A fork copies the transcript, including the failure that created it.
+        # That copied error must not count as a fresh failure of the fork; only
+        # messages created after the fork itself can trigger another burn.
+        $forkRec = Get-SessionRec $s.id
+        if ($forkRec -and $errCreated) {
+            try {
+                if ($forkRec.PSObject.Properties['createdAt'] -and $forkRec.createdAt) {
+                    $forkMs = [DateTimeOffset]::Parse([string]$forkRec.createdAt).ToUnixTimeMilliseconds()
+                    if ([int64]$errCreated -le $forkMs) { continue }
+                }
+            } catch { }
+        }
         # prompted-set dedup applies to the switch path (rate class): skip only when
         # this failure predates our last prompt for the session (fresh failures pass).
         # endpoint/connreset retries are allowed to hit the same session repeatedly
@@ -1897,6 +1937,217 @@ function Send-ContinueToSession {
     } finally { Pop-Location }
 }
 
+# ------------------------------------------------------- session burn / fork
+# Provider quota flags follow a session, not just an exit IP: resuming the same
+# session on a freshly switched server can flag the new IP with its first
+# request. The watchdog therefore abandons a flagged session and resumes its
+# fork, which carries the full projected transcript (fork is a local DB copy -
+# it costs no provider request). The mapping lives in state.json.sessions.
+
+function Get-SessionRec([string]$sessionID) {
+    if (-not $sessionID) { return $null }
+    if (-not $Script:State) { Load-State }
+    try {
+        $p = $Script:State.sessions.PSObject.Properties[$sessionID]
+        if ($p) { return $p.Value }
+    } catch { }
+    return $null
+}
+
+function Test-SessionBurned([string]$sessionID) {
+    $rec = Get-SessionRec $sessionID
+    if (-not $rec) { return $false }
+    try { return [bool]$rec.forkID } catch { return $false }
+}
+
+function Test-SessionExists([string]$sessionID) {
+    if (-not $sessionID) { return $false }
+    $r = Invoke-OC ("/api/session/{0}" -f $sessionID)
+    return [bool]($r -and $r.data -and $r.data.id)
+}
+
+function Get-ForkCountSince([datetime]$since) {
+    $n = 0
+    try {
+        foreach ($p in @($Script:State.sessions.PSObject.Properties)) {
+            $v = $p.Value
+            if (-not $v) { continue }
+            $fid = $null
+            try { $fid = [string]$v.forkID } catch { }
+            if (-not $fid) { continue }
+            try {
+                if ([datetime]::Parse([string]$v.burnedAt) -ge $since) { $n++ }
+            } catch { }
+        }
+    } catch { }
+    return $n
+}
+
+function Set-SessionTitle {
+    param([string]$sessionID, [string]$title)
+    if (-not $sessionID -or -not $title) { return $false }
+    $clean = (($title -replace '[\r\n]+', ' ') -replace '"', "'").Trim()
+    if ($clean.Length -gt 120) { $clean = $clean.Substring(0, 120) }
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        # PS5.1 + the npm shim split --data at literal spaces. JSON \u0020
+        # escapes keep the payload one argv token and still decode to a space.
+        $json = @{ title = $clean } | ConvertTo-Json -Compress
+        $json = $json.Replace(' ', '\u0020')
+        $body = $json.Replace('"', '\"')
+        $out = & opencode api patch ("/api/session/{0}" -f $sessionID) --data $body 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $msg = (($out -join ' ') -replace '\s+', ' ')
+            if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
+            Log ("session title update failed for {0}: {1}" -f $sessionID, $msg)
+            return $false
+        }
+        return $true
+    } catch {
+        Log ("session title update failed for {0}: {1}" -f $sessionID, $_.Exception.Message)
+        return $false
+    } finally { Pop-Location }
+}
+
+function New-SessionFork {
+    param(
+        [string]$sessionID,
+        [string]$reason = 'failover',
+        [string]$kind = '',
+        [string]$title = ''
+    )
+    if (-not $sessionID) { return $null }
+    if (-not $Script:Cfg.SessionForkEnabled) { return $null }
+    if (-not $Script:State) { Load-State }
+
+    $rec = Get-SessionRec $sessionID
+    $depth = 1
+    $rootID = $sessionID
+    if ($rec) {
+        try { if ($rec.depth) { $depth = [int]$rec.depth + 1 } } catch { }
+        try { if ($rec.rootID) { $rootID = [string]$rec.rootID } } catch { }
+    }
+    if ($depth -gt [int]$Script:Cfg.SessionForkMaxDepth) {
+        Log ("session {0} reached the fork depth limit ({1}) - not forking again" -f $sessionID, $Script:Cfg.SessionForkMaxDepth)
+        return $null
+    }
+    if ((Get-ForkCountSince (Get-Date).AddHours(-1)) -ge [int]$Script:Cfg.SessionForkMaxPerHour) {
+        Log ("session fork rate limit reached ({0}/hour) - not forking {1}" -f $Script:Cfg.SessionForkMaxPerHour, $sessionID)
+        return $null
+    }
+
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        $out = & opencode api post ("/api/session/{0}/fork" -f $sessionID) --data '{}' 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $msg = (($out -join ' ') -replace '\s+', ' ')
+            if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) }
+            Log ("session fork failed for {0}: {1}" -f $sessionID, $msg)
+            return $null
+        }
+        $resp = $null
+        try { $resp = (($out -join "`n") | ConvertFrom-Json) } catch { }
+        $forkID = $null
+        $forkTitle = ''
+        try { $forkID = [string]$resp.data.id } catch { }
+        try { $forkTitle = [string]$resp.data.title } catch { }
+        if (-not $forkID) {
+            Log ("session fork returned no id for {0}" -f $sessionID)
+            return $null
+        }
+
+        $now = Get-Date
+        $entry = [pscustomobject]@{
+            burnedAt  = $now.ToString('o')
+            forkID    = $forkID
+            forkTitle = $forkTitle
+            reason    = $reason
+            kind      = $kind
+            depth     = $depth
+            rootID    = $rootID
+        }
+        Add-Member -InputObject $Script:State.sessions -NotePropertyName $sessionID -NotePropertyValue $entry -Force
+        $forkRec = [pscustomobject]@{
+            createdAt  = $now.ToString('o')
+            depth      = $depth
+            rootID     = $rootID
+            forkedFrom = $sessionID
+        }
+        Add-Member -InputObject $Script:State.sessions -NotePropertyName $forkID -NotePropertyValue $forkRec -Force
+        Save-State
+
+        if ($title -and $title -notmatch '^\[burned\]') {
+            Set-SessionTitle $sessionID ('[burned] ' + $title) | Out-Null
+        }
+        Log ("session {0} burned by {1} errors - forked to {2} ({3}); the old session will not be prompted again" -f $sessionID, $kind, $forkID, $forkTitle)
+        return $forkID
+    } finally { Pop-Location }
+}
+
+function Resume-FailedSession {
+    param(
+        [pscustomobject]$Session,
+        [string]$Reason = 'failover',
+        [switch]$NoFork,
+        [switch]$AllowRepeat
+    )
+    if (-not $Session -or -not $Session.id) { return $false }
+    $id = [string]$Session.id
+    $rec = Get-SessionRec $id
+    $target = $id
+
+    # A burned session is never prompted again. If it already has a fork, that
+    # fork is the live continuation; if the fork was deleted, make a new one.
+    if ($rec -and $rec.forkID) {
+        $target = [string]$rec.forkID
+        if (-not (Test-SessionExists $target)) {
+            Log ("recorded fork {0} for burned session {1} no longer exists - forking again" -f $target, $id)
+            try { $rec.PSObject.Properties.Remove('forkID') } catch { }
+            $target = $id
+        }
+    }
+
+    if ($target -eq $id -and -not $NoFork -and $Script:Cfg.SessionForkEnabled) {
+        $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title)
+        if (-not $forkID) {
+            Log ("not continuing {0}: session fork failed and the flagged session was not reused" -f $id)
+            return $false
+        }
+        $target = $forkID
+    } elseif ($target -eq $id -and $NoFork -and (Test-SessionBurned $id)) {
+        Log ("not prompting burned session {0} (no fork available)" -f $id)
+        return $false
+    }
+
+    # Do not repeat a continue for the same failure event.
+    if (-not $AllowRepeat -and $Session.errCreated) {
+        $pr = $null
+        try { $pr = $Script:State.prompted.PSObject.Properties[$target] } catch { }
+        if ($pr) {
+            $fresh = $true
+            try { if ([int64]$Session.errCreated -le ([DateTimeOffset]::Parse([string]$pr.Value).ToUnixTimeMilliseconds())) { $fresh = $false } } catch { }
+            if (-not $fresh) { return $false }
+        }
+    }
+
+    if (Send-ContinueToSession -sessionID $target) {
+        $now = (Get-Date).ToString('o')
+        Add-Member -InputObject $Script:State.prompted -NotePropertyName $target -NotePropertyValue $now -Force
+        $tr = Get-SessionRec $target
+        if (-not $tr) {
+            $tr = New-Object PSObject
+            Add-Member -InputObject $Script:State.sessions -NotePropertyName $target -NotePropertyValue $tr -Force
+        }
+        Add-Member -InputObject $tr -NotePropertyName lastPromptAt -NotePropertyValue $now -Force
+        $n = 0
+        try { $n = [int]$tr.prompts } catch { }
+        Add-Member -InputObject $tr -NotePropertyName prompts -NotePropertyValue ($n + 1) -Force
+        Save-State
+        return $true
+    }
+    return $false
+}
+
 # ------------------------------------------------------------------- failover
 function Mark-Used([pscustomobject]$srv) {
     if (-not $srv -or -not $srv.host) { return }
@@ -2068,10 +2319,7 @@ function Invoke-Failover {
                 if (-not $fresh) { continue }
             }
         }
-        if (Send-ContinueToSession -sessionID $s.id) {
-            Add-Member -InputObject $Script:State.prompted -NotePropertyName $s.id -NotePropertyValue (Get-Date -Format 'o') -Force
-            Save-State
-        }
+        Resume-FailedSession -Session $s -Reason $Reason | Out-Null
     }
     Log 'failover complete'
 }
@@ -2197,10 +2445,9 @@ function Handle-Endpoint {
     $sess = Get-FailedSessions -kinds @('endpoint') -windowMinutes 120
     if ($sess) {
         foreach ($s in $sess) {
-            if (Send-ContinueToSession -sessionID $s.id) {
-                # soft path allows repeats, so do not mark the prompted set
-                Log ("continue sent to stuck session {0}" -f $s.id)
-            }
+            # Same server, so a flagged session cannot poison a fresh exit IP;
+            # burned sessions are still skipped by the helper.
+            Resume-FailedSession -Session $s -Reason 'endpoint-retry' -NoFork -AllowRepeat | Out-Null
         }
     } else {
         Log 'no sessions currently stuck on endpoint errors'
@@ -2216,6 +2463,51 @@ function Handle-Endpoint {
 }
 
 # ------------------------------------------------------------------- test modes
+if ($ForkSession -or $UnburnSession -or $ListBurned) {
+    Load-State
+    if ($ListBurned) {
+        $burned = @($Script:State.sessions.PSObject.Properties | Where-Object {
+            $_.Value -and $_.Value.PSObject.Properties['forkID'] -and $_.Value.forkID
+        })
+        if (-not $burned.Count) {
+            Log 'burned sessions: (none)'
+        } else {
+            foreach ($e in $burned) {
+                $v = $e.Value
+                $kind = ''
+                try { $kind = [string]$v.kind } catch { }
+                Log ("burned session: {0} -> fork {1} ({2}) at {3}" -f $e.Name, $v.forkID, $kind, $v.burnedAt)
+            }
+        }
+    }
+    if ($UnburnSession) {
+        $uKey = $UnburnSession.Trim()
+        $up = $Script:State.sessions.PSObject.Properties[$uKey]
+        if (-not $up) {
+            Log ("no burn record for " + $uKey)
+        } else {
+            $uFork = ''
+            try { $uFork = [string]$up.Value.forkID } catch { }
+            $Script:State.sessions.PSObject.Properties.Remove($uKey) | Out-Null
+            if ($uFork) { $Script:State.sessions.PSObject.Properties.Remove($uFork) | Out-Null }
+            Save-State
+            Log ("unburned session " + $uKey + " - it can be scanned and prompted again")
+        }
+    }
+    if ($ForkSession) {
+        $fKey = $ForkSession.Trim()
+        $fResp = Invoke-OC ("/api/session/{0}" -f $fKey)
+        if (-not $fResp -or -not $fResp.data -or -not $fResp.data.id) {
+            Log ("session not found: " + $fKey)
+        } else {
+            $fTitle = ''
+            try { $fTitle = [string]$fResp.data.title } catch { }
+            $fNew = New-SessionFork -sessionID $fKey -reason 'manual' -kind 'manual' -title $fTitle
+            if ($fNew) { Log ("manual fork: {0} -> {1}" -f $fKey, $fNew) }
+        }
+    }
+    return
+}
 if ($ListBanned -or $BanServer -or $UnbanServer) {
     Load-State
     if ($ListBanned) {
@@ -2427,6 +2719,12 @@ function Get-HeaderLines {
     try { $usedCount = ($Script:State.used.PSObject.Properties | Measure-Object).Count } catch { }
     $bannedCount = 0
     try { $bannedCount = @(Get-BannedEntries).Count } catch { }
+    $burnedCount = 0
+    try {
+        $burnedCount = @($Script:State.sessions.PSObject.Properties | Where-Object {
+            $_.Value -and $_.Value.PSObject.Properties['forkID'] -and $_.Value.forkID
+        }).Count
+    } catch { }
     $curKey = $null
     if ($cur) { $curKey = Get-ServerKey $cur }
     $freshCount = 0
@@ -2488,7 +2786,7 @@ function Get-HeaderLines {
         ('Server   : {0}{1}' -f (Format-ServerLabel $cur), $(if ($curBanned) { '   [BANNED]' } else { '' })),
         ('Tunnel   : {0}' -f $tunnel),
         ('Exit IP  : {0}    (checked {1})' -f $exitIp, $exitWhen),
-        ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    last failover: {4}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $global:LastFailover),
+        ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    burned: {4}    last failover: {5}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $burnedCount, $global:LastFailover),
         ('[T] switch now    [B] ban current    [L] bans editor    [R] rescan+revive    [C] clear used    [Q] quit'),
         ('----------------------------------------------------------------')
     )
@@ -3248,10 +3546,7 @@ if ($Watch) {
                                 $rev = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
                                 if ($rev) {
                                     foreach ($s in $rev) {
-                                        if (Send-ContinueToSession -sessionID $s.id) {
-                                            Add-Member -InputObject $Script:State.prompted -NotePropertyName $s.id -NotePropertyValue (Get-Date -Format 'o') -Force
-                                            Save-State
-                                        }
+                                        Resume-FailedSession -Session $s -Reason 'revive' | Out-Null
                                     }
                                 } else {
                                     Log 'revive pass: no failed sessions found'
@@ -3282,4 +3577,4 @@ if ($Watch) {
     }
 }
 
-Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -ListBanned / -BanServer host:port / -UnbanServer host:port"
+Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ListBurned / -UnburnSession ses_id"
