@@ -106,7 +106,7 @@ $Script:Cfg = @{
     HeartbeatSec      = 15
     WebCheckUrl       = 'https://api.ipify.org/?format=json'
     AffectedWindowMin = 120
-    SessionResumeFreshMin = 15  # automatic post-switch resume: only sessions active this recently
+    SessionResumeFreshMin = 15  # automatic post-switch resume: ignore failures older than this many minutes
     ConnResetPattern   = 'ECONNRESET|Connection lost while reading the response'
     ConnResetWindowSec = 180    # count connection-loss failures within this window
     ConnResetMinCount  = 3      # threshold within the window -> full server failover
