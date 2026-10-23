@@ -91,6 +91,10 @@ Notable behaviors:
   follow-up (a real user message) marks a session as "moved on".
 - **Fresh-failure dedup** - once-prompted sessions are skipped only while their failure
   predates the last prompt; a *new* failure re-flags them.
+- **Fresh-resume window** - automatic post-switch resumes only consider failures at
+  most `SessionResumeFreshMin` minutes old (default 15), using the error timestamp
+  rather than the session's updated time; abandoned test sessions are left alone. The
+  manual `R` revive still uses the wider `AffectedWindowMin`.
 - **Boot recovery** - booting into an already-dead network (e.g. the previous watchdog
   exited while owning the tunnel) recovers on the first health tick, no cooldown wait.
 - **Resize-proof pinned dashboard** - the console re-renders from an in-memory event
@@ -139,6 +143,12 @@ If a fork is flagged later it is forked again. `SessionForkMaxDepth` (default 6)
 chain per root session and `SessionForkMaxPerHour` (default 30) caps total forks to stop
 a switch/fork runaway. A deleted fork is recreated on the next resume. The mapping is
 kept in `state.json.sessions`; the dashboard shows a `burned` count.
+
+Automatic post-switch resumes only consider failures at most
+`SessionResumeFreshMin` minutes old (default 15). The error timestamp is the deciding
+clock, so opening an old session (which refreshes `updated`) does not make it eligible.
+The manual `R` revive still scans `AffectedWindowMin` (default 120 min) and deliberately
+ignores the freshness cutoff.
 
 ### Bans
 
@@ -359,7 +369,7 @@ settle, re-applies the pinned buffer at the top-left, then redraws.
 | `T` | switch to a random unused, unbanned server now (manual/thorough flow) |
 | `B` | ban the current server and switch away from it immediately (manual ban = red) |
 | `L` | open the bans/server editor (banned first; arrows move, `Enter` toggles, `R` rescans, `Esc`/`L` closes) |
-| `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure |
+| `R` | rescan the Happ GUI memory for new server configs **and** re-prompt every session whose latest event is a failure (manual revive; ignores the automatic `SessionResumeFreshMin` cutoff) |
 | `U` | start/stop continuous server update; while it runs, click Happ -> `...` -> `Пинг всех`, then press `U` again to import and refresh the list |
 | `C` | clear the used-server list; bans are unchanged |
 | `Q` | quit (releases the owned core and tunnel; reconnect via the Happ GUI) |
@@ -376,7 +386,7 @@ powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListServers
 # state, active server, core, and fill the server cache
 powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -TestInit
 
-# list sessions with current provider failures
+# list sessions with current provider failures and the failure age
 powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -TestSessions
 
 # end-to-end continue-prompt probe on a throwaway session
@@ -425,6 +435,9 @@ Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptio
   source is tagged `[burned]` and never prompted again (default `$true`)
 - `SessionForkMaxDepth` / `SessionForkMaxPerHour` - fork-chain and total-per-hour caps
   (defaults 6 / 30)
+- `SessionResumeFreshMin` - post-switch automatic resume ignores failures older than
+  this many minutes (default 15); the manual `R` revive still uses the wider
+  `AffectedWindowMin` (default 120)
 - `MaxSwitchAttempts` - maximum candidate-selection passes per failover; each pass tries
   every eligible server in random order
 - `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern`, `TimeoutPattern` - error classifiers

@@ -106,6 +106,7 @@ $Script:Cfg = @{
     HeartbeatSec      = 15
     WebCheckUrl       = 'https://api.ipify.org/?format=json'
     AffectedWindowMin = 120
+    SessionResumeFreshMin = 15  # automatic post-switch resume: only sessions active this recently
     ConnResetPattern   = 'ECONNRESET|Connection lost while reading the response'
     ConnResetWindowSec = 180    # count connection-loss failures within this window
     ConnResetMinCount  = 3      # threshold within the window -> full server failover
@@ -1911,7 +1912,7 @@ function Invoke-OC {
 }
 
 function Get-FailedSessions {
-    param([int]$windowMinutes = 120, [string[]]$kinds = @('rate','endpoint','connreset','timeout'))
+    param([int]$windowMinutes = 120, [int]$freshMinutes = 0, [string[]]$kinds = @('rate','endpoint','connreset','timeout'))
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { Log 'cannot list opencode sessions'; return @() }
     $cutoff = (Get-Date).AddMinutes(-1 * $windowMinutes)
@@ -1972,6 +1973,17 @@ function Get-FailedSessions {
                     if ([int64]$errCreated -le $forkMs) { continue }
                 }
             } catch { }
+        }
+        # Automatic post-switch resumes only revive fresh work. A session whose
+        # failure is older than the cutoff is abandoned, or was merely re-opened:
+        # opening refreshes time.updated without changing the error, so the error
+        # timestamp is the deciding clock, not the session update time.
+        if ($freshMinutes -gt 0 -and $errCreated) {
+            $ageMin = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$errCreated) / 60000.0
+            if ($ageMin -gt $freshMinutes) {
+                Log ("not resuming {0} ({1}): failure is {2:N0} min old (fresh limit {3} min)" -f $s.id, $s.title, $ageMin, $freshMinutes)
+                continue
+            }
         }
         # prompted-set dedup applies to the switch path (rate/timeout classes):
         # skip only when this failure predates our last prompt for the session
@@ -2424,8 +2436,10 @@ function Invoke-Failover {
         $affected = @()
         Log 'fast failover: deferring affected-session scan until after the switch'
     } else {
-        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
-        Log ("affected sessions: " + (($affected | ForEach-Object { $_.id }) -join ', '))
+        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+        $affectedIds = (($affected | ForEach-Object { $_.id }) -join ', ')
+        if (-not $affectedIds) { $affectedIds = 'none' }
+        Log ("affected sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $affectedIds)
     }
 
     # A live desktop app keeps HTTP/SSE connections pinned to the old core.
@@ -2538,7 +2552,10 @@ function Invoke-Failover {
         Start-Sleep -Seconds $settleSec
     }
 
-    $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
+    $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+    $postIds = (($postReload | ForEach-Object { $_.id }) -join ', ')
+    if (-not $postIds) { $postIds = 'none' }
+    Log ("post-reload failed sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $postIds)
     # Only continues sent during this failover's prompt phase are "connect ->
     # continue" evidence against the freshly selected server. A later revive or
     # endpoint-retry continue on a long-running server must not ban it.
@@ -2875,8 +2892,14 @@ if ($TestSwitch) {
 if ($TestSessions) {
     Load-State
     $r = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin
-    if (-not $r) { Log 'no rate-limited sessions found' }
-    else { $r | ForEach-Object { Log ("[rl] {0} (updated {1}) : {2}" -f $_.id, $_.when, $_.msg) } }
+    if (-not $r) { Log 'no failed sessions found' }
+    else {
+        $r | ForEach-Object {
+            $age = '?'
+            if ($_.errCreated) { $age = [math]::Round(([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$_.errCreated) / 60000.0) }
+            Log ("[rl] {0} (updated {1}, failure {2} min old) : {3}" -f $_.id, $_.when, $age, $_.msg)
+        }
+    }
     return
 }
 if ($TestProbe) {
