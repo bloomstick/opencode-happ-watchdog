@@ -29,8 +29,9 @@ is never reused on the new exit IP.
 1. **Watches** the OpenCode log (`~/.local/share/opencode/log/opencode.log`) for
    `Rate limit exceeded`, `Too many requests`, and free-usage errors
    (`Free usage limit reached`, `Free usage exceeded`), and the OpenCode session API
-   for `Endpoint is unavailable` and connection-loss (`ECONNRESET`) failures
-   (connection resets never reach the server log). An exact `Free usage limit reached.
+   for `Endpoint is unavailable`, connection-loss (`ECONNRESET`), and provider
+   `Timed out waiting for response data` failures (neither resets nor timeouts reach
+   the server log). An exact `Free usage limit reached.
    Subscribe to OpenCode Go to keep going: https://opencode.ai/go` error automatically
    bans the current server and is shown in **orange** in the bans editor (manual bans
    stay red).
@@ -80,6 +81,7 @@ the normal two-minute cooldown. Quota errors bypass the cooldown entirely. Manua
 | quota | exact `Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go` in the log | **auto-ban current server (orange)** + immediate fast failover, bypassing cooldown |
 | endpoint | session API (`Endpoint is unavailable`) | same-server `continue` retry after ~60s; switch after 2 failed rounds |
 | connreset | session API (`ECONNRESET` / `Connection lost while reading the response`) | **3 failures within 3 minutes -> failover** |
+| timeout | session API (`Timed out waiting for response data`, `TimeoutError`, `ETIMEDOUT`) | failover; **auto-ban only when the timeout lands within 120s of our `continue`** (connect -> continue -> immediate timeout = bad server). A timeout after the server worked for a while only marks it **used**, no ban |
 | tunnel-dead | plain system-route probes (two URLs, 30s cadence) | route dead twice in a row (~60s) -> failover; a vanished TUN adapter is restored directly |
 
 Notable behaviors:
@@ -102,11 +104,18 @@ fresh window. Subscription pool IPs may be shared with other users, so a freshly
 selected IP can already be partially burned; if rotation keeps landing on exhausted
 IPs, the quota window itself is the remaining wait.
 
-Only the exact OpenCode Go free-usage message triggers the automatic ban. Generic
+Only the exact OpenCode Go free-usage message triggers the automatic quota ban. Generic
 `Rate limit exceeded`/`Too many requests` errors still switch servers but do not
 create a ban. Automatic quota bans are stored as objects in `bans.json`
 (`source: automatic`, `kind: auto`, `reason`, `at`); old timestamp-string bans remain
 manual. An existing manual ban is never rewritten by the automatic path.
+
+Provider timeouts are treated more carefully because they also occur on healthy
+servers. A timeout is automatically banned only when it arrives **immediately after
+the watchdog's own `continue`** (within `TimeoutInstantSec`, default 120s) - that is
+the connect -> continue -> timeout pattern of a server that cannot sustain the first
+request. If the session had been working for some time before the timeout, the server
+is only marked **used** and rotated away; it is not banned.
 
 ### Server exhaustion / rotation
 
@@ -417,8 +426,10 @@ Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptio
   (defaults 6 / 30)
 - `MaxSwitchAttempts` - maximum candidate-selection passes per failover; each pass tries
   every eligible server in random order
-- `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern` - error classifiers
+- `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern`, `TimeoutPattern` - error classifiers
 - `ConnResetWindowSec` / `ConnResetMinCount` / `ConnResetScanSec` - burst thresholds
+- `TimeoutInstantSec` - a provider timeout within this many seconds of our `continue`
+  auto-bans the fresh server (default 120s); later timeouts only mark it used
 - `TunnelScanSec`, `ProbeUrl2`, `ProbeTimeoutSec` - route-health probe settings
 - `CaptureWindowSec` / `CaptureIntervalSec` - `[U]` capture window (default 1800s,
   `U` stops earlier) and pause between memory scans (default 0.3s)

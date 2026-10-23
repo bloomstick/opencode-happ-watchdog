@@ -110,6 +110,8 @@ $Script:Cfg = @{
     ConnResetWindowSec = 180    # count connection-loss failures within this window
     ConnResetMinCount  = 3      # threshold within the window -> full server failover
     ConnResetScanSec   = 20     # API-level scan cadence (ECONNRESET never reaches opencode.log)
+    TimeoutPattern     = '(?i)(timed out|timeout|ETIMEDOUT)'  # session-level provider timeout errors
+    TimeoutInstantSec  = 120    # timeout within this window after our continue -> server is bad, ban it
     TunnelScanSec      = 30     # system-route health probe cadence
     ProbeUrl2          = 'https://checkip.amazonaws.com'
     ProbeTimeoutSec    = 8
@@ -1908,7 +1910,7 @@ function Invoke-OC {
 }
 
 function Get-FailedSessions {
-    param([int]$windowMinutes = 120, [string[]]$kinds = @('rate','endpoint','connreset'))
+    param([int]$windowMinutes = 120, [string[]]$kinds = @('rate','endpoint','connreset','timeout'))
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { Log 'cannot list opencode sessions'; return @() }
     $cutoff = (Get-Date).AddMinutes(-1 * $windowMinutes)
@@ -1947,6 +1949,7 @@ function Get-FailedSessions {
                     }
                     elseif ($m.error.message -match $Script:Cfg.EndpointPattern) { $kind = 'endpoint' }
                     elseif ($m.error.message -match $Script:Cfg.ConnResetPattern) { $kind = 'connreset' }
+                    elseif ($m.error.message -match $Script:Cfg.TimeoutPattern) { $kind = 'timeout' }
                 }
                 if ($kind -and ($kinds -contains $kind) -and (-not $errKind)) {
                     $errKind = $kind
@@ -1969,10 +1972,11 @@ function Get-FailedSessions {
                 }
             } catch { }
         }
-        # prompted-set dedup applies to the switch path (rate class): skip only when
-        # this failure predates our last prompt for the session (fresh failures pass).
-        # endpoint/connreset retries are allowed to hit the same session repeatedly
-        if ($kinds -contains 'rate') {
+        # prompted-set dedup applies to the switch path (rate/timeout classes):
+        # skip only when this failure predates our last prompt for the session
+        # (fresh failures pass). endpoint/connreset retries are allowed to hit
+        # the same session repeatedly.
+        if (($kinds -contains 'rate') -or ($kinds -contains 'timeout')) {
             $props = $Script:State.prompted.PSObject.Properties[$s.id]
             if ($props -and $errCreated) {
                 $fresh = $false
@@ -2399,6 +2403,8 @@ function Invoke-Failover {
     if ($cur) {
         if ($Reason -eq 'quota') {
             Add-AutoBannedServer (Get-ServerKey $cur) 'free usage limit' | Out-Null
+        } elseif ($Reason -eq 'timeout-instant') {
+            Add-AutoBannedServer (Get-ServerKey $cur) 'instant timeout after continue' | Out-Null
         }
         Invoke-FailoverReason-Log $Reason $cur
         Mark-Used $cur
@@ -2411,7 +2417,7 @@ function Invoke-Failover {
         $affected = @()
         Log 'fast failover: deferring affected-session scan until after the switch'
     } else {
-        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
+        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
         Log ("affected sessions: " + (($affected | ForEach-Object { $_.id }) -join ', '))
     }
 
@@ -2525,7 +2531,7 @@ function Invoke-Failover {
         Start-Sleep -Seconds $settleSec
     }
 
-    $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
+    $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
     $seen = @{}
     foreach ($s in (@($affected) + @($postReload))) {
         if ($seen.ContainsKey($s.id)) { continue }
@@ -2567,37 +2573,76 @@ function Test-OpLogTail {
     return @{ rate = $rateNewest; quota = $quotaNewest; endpoint = $endNewest }
 }
 
-# ------- connection-loss burst detection (API-based) ------------------------
-# ECONNRESET never reaches opencode.log; the only persisted record is the
-# session message error. Counts distinct connection-loss failures across
-# top-level sessions created inside the recent window; failures older than
-# state.connResetUntil were already processed.
-function Test-ConnResetBurst {
+# ------- session-level failure scan (API-based) ------------------------------
+# ECONNRESET and provider timeouts never reach opencode.log; the only persisted
+# record is the session message error. One pass counts connection-loss failures
+# inside the recent window and collects the newest timeout per top-level
+# session. Failures at or before state.connResetUntil / state.timeoutUntil were
+# already processed.
+function Test-SessionFailureScan {
+    param([int64]$TimeoutFloorMs = 0)
+    $result = [pscustomobject]@{ connReset = 0; timeouts = @() }
     $root = Invoke-OC '/api/session'
-    if ($null -eq $root -or -not $root.data) { return 0 }
+    if ($null -eq $root -or -not $root.data) { return $result }
     $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
     $winMs = $Script:Cfg.ConnResetWindowSec * 1000
     $floorMs = $nowMs - $winMs
     $processedMs = 0
     try { $processedMs = [int64][string]$Script:State.connResetUntil } catch { $processedMs = 0 }
+    $toProcessedMs = 0
+    try { $toProcessedMs = [int64][string]$Script:State.timeoutUntil } catch { $toProcessedMs = 0 }
+    if ($TimeoutFloorMs -gt $toProcessedMs) { $toProcessedMs = $TimeoutFloorMs }
+    # sessions untouched for longer than this cannot contain a fresh failure
+    $updFloorMs = $nowMs - ([Math]::Max([int]$Script:Cfg.ConnResetWindowSec, 600) * 1000)
     $count = 0
+    $timeouts = @{}
     foreach ($s in $root.data) {
         if ($Script:Cfg.TopLevelOnly -and $s.parentID) { continue }
         $updMs = 0
         try { $updMs = [int64]$s.time.updated } catch { $updMs = 0 }
-        if ($updMs -lt ($floorMs - 60000)) { continue }   # untouched since before the window
-        if ($processedMs -gt 0 -and $updMs -le $processedMs) { continue }
+        if ($updMs -lt $updFloorMs) { continue }
         $msgsResp = Invoke-OC ("/api/session/{0}/message?order=desc&limit=8" -f $s.id)
         if (-not $msgsResp -or -not $msgsResp.data) { continue }
         foreach ($m in $msgsResp.data) {
             $cMs = 0
             try { $cMs = [int64]$m.time.created } catch { $cMs = 0 }
-            if ($cMs -lt $floorMs) { continue }
-            if ($processedMs -gt 0 -and $cMs -le $processedMs) { continue }
-            if ($m.error -and $m.error.message -and ($m.error.message -match $Script:Cfg.ConnResetPattern)) { $count++ }
+            if (-not $m.error -or -not $m.error.message) { continue }
+            if ($m.error.message -match $Script:Cfg.ConnResetPattern) {
+                if ($cMs -lt $floorMs) { continue }
+                if ($processedMs -gt 0 -and $cMs -le $processedMs) { continue }
+                $count++
+            } elseif ($m.error.message -match $Script:Cfg.TimeoutPattern) {
+                if ($toProcessedMs -gt 0 -and $cMs -le $toProcessedMs) { continue }
+                $prev = $null
+                if ($timeouts.ContainsKey([string]$s.id)) { $prev = $timeouts[[string]$s.id] }
+                if (-not $prev -or $cMs -gt [int64]$prev.created) {
+                    $msg = [string]$m.error.message
+                    if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
+                    $timeouts[[string]$s.id] = [pscustomobject]@{ sessionID = [string]$s.id; created = [int64]$cMs; message = $msg }
+                }
+            }
         }
     }
-    return $count
+    $result.connReset = $count
+    $result.timeouts = @($timeouts.Values | Sort-Object created)
+    return $result
+}
+
+# A timeout is "instant" when it arrives shortly after the watchdog's own
+# continue prompt for that session: connect -> continue -> timeout. That points
+# at the freshly selected server, so it is worth banning. A timeout after the
+# session had been running for a while is ordinary provider behaviour: mark the
+# server used and switch, but keep the server for later rotation.
+function Test-TimeoutWasInstant([object]$failure) {
+    if (-not $failure) { return $false }
+    $pr = $null
+    try { $pr = $Script:State.prompted.PSObject.Properties[[string]$failure.sessionID] } catch { }
+    if (-not $pr) { return $false }
+    $promptMs = 0
+    try { $promptMs = [DateTimeOffset]::Parse([string]$pr.Value).ToUnixTimeMilliseconds() } catch { return $false }
+    $ageSec = ([double]$failure.created - [double]$promptMs) / 1000.0
+    if ($ageSec -lt 0) { return $false }
+    return ($ageSec -le [int]$Script:Cfg.TimeoutInstantSec)
 }
 
 # ------- system-route tunnel health ------------------------------------------
@@ -2641,6 +2686,8 @@ function Invoke-FailoverReason-Log([string]$reason, [pscustomobject]$cur) {
     switch ($reason) {
         'auto' { Log ("rate limit detected; current server {0}" -f $label) }
         'quota' { Log ("free usage limit reached; current server {0} auto-banned and marked used" -f $label) }
+        'timeout-instant' { Log ("timeout immediately after continue; current server {0} auto-banned and marked used" -f $label) }
+        'timeout' { Log ("timeout after normal use; current server {0} marked used (not banned)" -f $label) }
         'manual' { Log ("manual switch requested; current server {0} marked used" -f $label) }
         'manual-ban' { Log ("manual ban requested; leaving current server {0} and marking it used" -f $label) }
         'connreset-burst' { Log ("connection-loss burst (ECONNRESET); current server {0} marked used" -f $label) }
@@ -3601,6 +3648,12 @@ if ($CaptureAll) {
 if ($Watch) {
     Load-State
     $global:LastFailover = Get-Date
+    # Ignore timeout errors that predate this watchdog run: old sessions are
+    # not evidence against the currently selected server.
+    try {
+        Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string][DateTimeOffset]::Now.ToUnixTimeMilliseconds()) -Force
+        Save-State
+    } catch { }
     Log 'watchdog starting; tracking current server as used'
     $cur = Get-ActiveServer
     if ($cur) {
@@ -3679,12 +3732,43 @@ if ($Watch) {
                 $Script:Soft.lastSeen = $fails.endpoint
                 Handle-Endpoint
             }
-            # connection-loss bursts (ECONNRESET never reach opencode.log - scan the
-            # session API on its own slower cadence)
+            # connection-loss bursts and provider timeouts (neither reaches
+            # opencode.log - scan the session API on its own slower cadence)
             if ($null -eq $Script:ConnResetLast -or ((Get-Date) - $Script:ConnResetLast).TotalSeconds -ge $Script:Cfg.ConnResetScanSec) {
                 $Script:ConnResetLast = Get-Date
-                $crCount = Test-ConnResetBurst
-                if ($crCount -ge $Script:Cfg.ConnResetMinCount) {
+                $scan = Test-SessionFailureScan
+                $lastFailoverMs = ([DateTimeOffset]$global:LastFailover).ToUnixTimeMilliseconds()
+                $newTimeouts = @($scan.timeouts | Where-Object { $_ -and [int64]$_.created -gt $lastFailoverMs })
+                $instantTimeout = $null
+                $newestTimeout = $null
+                foreach ($to in $newTimeouts) {
+                    if (-not $newestTimeout -or [int64]$to.created -gt [int64]$newestTimeout.created) { $newestTimeout = $to }
+                    if (-not $instantTimeout -and (Test-TimeoutWasInstant $to)) { $instantTimeout = $to }
+                }
+                $timeoutHandled = $false
+                if ($instantTimeout) {
+                    Log ("timeout immediately after continue in {0} - auto-banning current server and fast switching" -f $instantTimeout.sessionID)
+                    $until = [int64]$instantTimeout.created
+                    try { $until = [Math]::Max($until, [int64][string]$Script:State.timeoutUntil) } catch { }
+                    Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
+                    Save-State
+                    $timeoutHandled = $true
+                    Invoke-Failover -Reason 'timeout-instant' -Fast
+                } elseif ($newestTimeout) {
+                    if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
+                        Log ("timeout in {0} after the server had been in use - marking it used and switching (no ban)" -f $newestTimeout.sessionID)
+                        $until = [int64]$newestTimeout.created
+                        try { $until = [Math]::Max($until, [int64][string]$Script:State.timeoutUntil) } catch { }
+                        Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
+                        Save-State
+                        $timeoutHandled = $true
+                        Invoke-Failover -Reason 'timeout' -Fast
+                    } else {
+                        Log 'timeout detected but failover cooldown is active - waiting'
+                    }
+                }
+                $crCount = [int]$scan.connReset
+                if (-not $timeoutHandled -and $crCount -ge $Script:Cfg.ConnResetMinCount) {
                     if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
                         Log ("{0} connection-loss failures within {1}s - fast switching server" -f $crCount, $Script:Cfg.ConnResetWindowSec)
                         Add-Member -InputObject $Script:State -NotePropertyName connResetUntil -NotePropertyValue ([string][DateTimeOffset]::Now.ToUnixTimeMilliseconds()) -Force
@@ -3793,7 +3877,7 @@ if ($Watch) {
                                 # revive pass: prompt sessions whose latest visible event
                                 # is a failure - picks up sessions missed while they were
                                 # temporarily masked (idle marker) or prompted earlier
-                                $rev = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset')
+                                $rev = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
                                 if ($rev) {
                                     foreach ($s in $rev) {
                                         Resume-FailedSession -Session $s -Reason 'revive' | Out-Null
