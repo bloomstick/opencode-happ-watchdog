@@ -126,7 +126,7 @@ request and no quota use), tags the old session `[burned]`, and sends `continue`
 fork. Burned sessions are never scanned or prompted again; their fork carries the work.
 
 If a fork is flagged later it is forked again. `SessionForkMaxDepth` (default 6) caps the
-chain per root session and `SessionForkMaxPerHour` (default 8) caps total forks to stop
+chain per root session and `SessionForkMaxPerHour` (default 30) caps total forks to stop
 a switch/fork runaway. A deleted fork is recreated on the next resume. The mapping is
 kept in `state.json.sessions`; the dashboard shows a `burned` count.
 
@@ -357,6 +357,12 @@ settle, re-applies the pinned buffer at the top-left, then redraws.
 ## Diagnostics (no automatic switches)
 
 ```powershell
+# continuous update: capture while you run Happ -> ... -> Пинг всех, then import
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -CaptureAll -CaptureSeconds 180
+
+# list every cached endpoint/profile (active/used/banned tags included)
+powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -ListServers
+
 # state, active server, core, and fill the server cache
 powershell -ExecutionPolicy Bypass -File .\happ-failover.ps1 -TestInit
 
@@ -408,12 +414,14 @@ Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptio
 - `SessionForkEnabled` - fork a failed session before resuming it after a switch; the
   source is tagged `[burned]` and never prompted again (default `$true`)
 - `SessionForkMaxDepth` / `SessionForkMaxPerHour` - fork-chain and total-per-hour caps
-  (defaults 6 / 8)
+  (defaults 6 / 30)
 - `MaxSwitchAttempts` - maximum candidate-selection passes per failover; each pass tries
   every eligible server in random order
 - `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern` - error classifiers
 - `ConnResetWindowSec` / `ConnResetMinCount` / `ConnResetScanSec` - burst thresholds
 - `TunnelScanSec`, `ProbeUrl2`, `ProbeTimeoutSec` - route-health probe settings
+- `CaptureWindowSec` / `CaptureIntervalSec` - `[U]` capture window (default 1800s,
+  `U` stops earlier) and pause between memory scans (default 0.3s)
 
 `-ProjectDir` overrides the OpenCode project context. `-PollSeconds` and `-CooldownSec`
 are command-line overrides for the loop.
@@ -431,9 +439,10 @@ are command-line overrides for the loop.
 - `configs/<host>_<port>__<hash>.json` - profile-keyed config for a distinct
   credential/transport on a shared endpoint (also contains credentials; private).
 - `captures/` - persistent raw snapshots from `capture-happ-memory.py`; **credentials,
-  gitignored/private**.
-- `capture-happ-memory.py` - continuous Happ/xray memory scanner. Start it before
-  `Пинг всех`; it saves each complete config immediately so unloading cannot lose it.
+  gitignored/private**. `[U]`/`-CaptureAll` also write `capture-run.out.log` and
+  `capture-run.err.log` there so the dashboard can tail scanner output.
+- `capture-happ-memory.py` - continuous Happ/xray memory scanner. `[U]` starts it
+  automatically; it saves each complete config immediately so unloading cannot lose it.
 - `import-happ-profiles.py` - converts full captured Happ/xray JSON files into profile
   cache entries; it skips groups and existing files and is safe to keep in the repo.
 
