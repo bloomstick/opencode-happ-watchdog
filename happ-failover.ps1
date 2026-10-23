@@ -27,6 +27,8 @@
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ForkSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBurned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnburnSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -CaptureAll [-CaptureSeconds 120]
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListServers
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -Watch [-Interactive] [-ProjectDir <dir>]
 #>
 param(
@@ -43,6 +45,9 @@ param(
     [string]$ForkSession,
     [string]$UnburnSession,
     [switch]$ListBurned,
+    [switch]$CaptureAll,
+    [switch]$ListServers,
+    [int]$CaptureSeconds = 120,
     [int]$PollSeconds = 5,
     [int]$CooldownSec = 120,
     [string]$ProjectDir = ''
@@ -57,6 +62,7 @@ $Script:Cfg = @{
     BansPath          = (Join-Path $PSScriptRoot 'bans.json')
     LogPath           = (Join-Path $PSScriptRoot 'failover.log')
     ConfigCacheDir    = (Join-Path $PSScriptRoot 'configs')
+    CapturesDir       = (Join-Path $PSScriptRoot 'captures')
     OpLogPath         = "$env:USERPROFILE\.local\share\opencode\log\opencode.log"
     # directory context for `opencode api` (sessions of the project to be healed);
     # defaults to the directory the script was launched from, can be set with -ProjectDir
@@ -107,13 +113,15 @@ $Script:Cfg = @{
     TunnelScanSec      = 30     # system-route health probe cadence
     ProbeUrl2          = 'https://checkip.amazonaws.com'
     ProbeTimeoutSec    = 8
+    CaptureWindowSec   = 1800  # [U] capture window; [U] again stops sooner
+    CaptureIntervalSec = 0.3   # pause between memory scans
 }
 
 # public: resolve the OpenCode project context (defaults to the launch directory)
 if (-not $ProjectDir) { $ProjectDir = (Get-Location).Path }
 $Script:Cfg.ProjectDir = $ProjectDir
 
-foreach ($p in @($Script:Cfg.ToolDir, $Script:Cfg.ConfigCacheDir)) {
+foreach ($p in @($Script:Cfg.ToolDir, $Script:Cfg.ConfigCacheDir, $Script:Cfg.CapturesDir)) {
     if (-not (Test-Path $p)) { New-Item -ItemType Directory -Force -Path $p | Out-Null }
 }
 
@@ -128,6 +136,7 @@ $Script:PendingWinH = -1
 $Script:PendingWinAt = $null
 $Script:BansEditor = $null
 $Script:SuppressRender = $false
+$Script:Capture = $null
 
 function Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
@@ -883,6 +892,216 @@ function Update-ConfigCache {
     }
     Log ("config cache scan done: new=$saved aliases=$aliases total=$total")
     return ($saved + $aliases)
+}
+
+# --------------------------------------------------------------- capture mode
+# [U] / -CaptureAll: the tool runs the persistent Happ memory scanner while the
+# user clicks Happ -> ... -> Ping all, then imports the snapshots and refreshes
+# the cache. The scanner stays a child process so the dashboard never blocks on
+# a full memory scan; its output is tailed into the event log.
+function Get-PythonLauncher {
+    foreach ($name in @('python', 'python3')) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue |
+            Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1
+        if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+            return [pscustomobject]@{ exe = [string]$cmd.Source; prefix = '' }
+        }
+    }
+    $cmd = Get-Command py -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandType -eq 'Application' } | Select-Object -First 1
+    if ($cmd -and $cmd.Source -and (Test-Path $cmd.Source)) {
+        return [pscustomobject]@{ exe = [string]$cmd.Source; prefix = '-3' }
+    }
+    return $null
+}
+
+function Get-CaptureFileCount {
+    return @(Get-ChildItem $Script:Cfg.CapturesDir -Filter 'capture-*.json' -File -ErrorAction SilentlyContinue).Count
+}
+
+function Read-CaptureProcessOutput {
+    if (-not $Script:Capture) { return }
+    try {
+        $outLog = [string]$Script:Capture.outLog
+        if (Test-Path $outLog) {
+            $lines = @(Get-Content $outLog -Encoding UTF8 -ErrorAction Stop)
+            $last = [int]$Script:Capture.lastOut
+            if ($last -lt 0) { $last = 0 }
+            for ($i = $last; $i -lt $lines.Count; $i++) {
+                $line = [string]$lines[$i]
+                if (-not $line.Trim()) { continue }
+                if ($line -match '^CAPTURE ') {
+                    Log ('[capture] ' + $line)
+                } elseif ($line -match '^unique configs captured:') {
+                    Log ('[capture] ' + $line)
+                } elseif ($line -match '(?i)(traceback|error|exception|failed)') {
+                    Log ('[capture] ' + $line)
+                }
+            }
+            $Script:Capture.lastOut = $lines.Count
+        }
+    } catch { }
+    try {
+        $errLog = [string]$Script:Capture.errLog
+        if (Test-Path $errLog) {
+            $errLines = @(Get-Content $errLog -Encoding UTF8 -ErrorAction Stop)
+            $last = [int]$Script:Capture.lastErr
+            if ($last -lt 0) { $last = 0 }
+            for ($i = $last; $i -lt $errLines.Count; $i++) {
+                $line = [string]$errLines[$i]
+                if ($line.Trim()) { Log ('[capture] ' + $line) }
+            }
+            $Script:Capture.lastErr = $errLines.Count
+        }
+    } catch { }
+}
+
+function Import-CapturedProfiles {
+    $py = Get-PythonLauncher
+    if (-not $py) {
+        Log 'profile import skipped: Python 3 was not found'
+        return 0
+    }
+    $script = Join-Path $Script:Cfg.ToolDir 'import-happ-profiles.py'
+    if (-not (Test-Path $script)) {
+        Log ('profile import skipped: missing ' + $script)
+        return 0
+    }
+    $argv = @()
+    if ($py.prefix) { $argv += $py.prefix }
+    $argv += @($script, '--captures', $Script:Cfg.CapturesDir, '--cache', $Script:Cfg.ConfigCacheDir)
+    $created = 0
+    try {
+        $out = & $py.exe @argv 2>&1
+        foreach ($line in @($out)) {
+            $s = [string]$line
+            if (-not $s.Trim()) { continue }
+            if ($s -match '^create=(\d+)') {
+                $created = [int]$Matches[1]
+                Log ('[import] ' + $s)
+            } elseif ($s -match '^(created |PARSE FAIL|usage:|import-happ-profiles\.py: error)') {
+                Log ('[import] ' + $s)
+            }
+        }
+    } catch {
+        Log ('profile import failed: ' + $_.Exception.Message)
+    }
+    return $created
+}
+
+function Start-CaptureMode {
+    param([int]$Seconds = 0)
+    if ($Script:Capture) {
+        Log 'continuous capture is already running - press [U] to stop and import'
+        return $false
+    }
+    if (-not (Get-Process Happ -ErrorAction SilentlyContinue | Select-Object -First 1)) {
+        Log 'continuous capture: Happ GUI is not running'
+        return $false
+    }
+    $py = Get-PythonLauncher
+    if (-not $py) {
+        Log 'continuous capture needs Python 3 (python.exe or py.exe) - install Python or run the capture scripts manually'
+        return $false
+    }
+    $script = Join-Path $Script:Cfg.ToolDir 'capture-happ-memory.py'
+    if (-not (Test-Path $script)) {
+        Log ('continuous capture: missing ' + $script)
+        return $false
+    }
+    if ($Seconds -le 0) { $Seconds = [int]$Script:Cfg.CaptureWindowSec }
+    if (-not (Test-Path $Script:Cfg.CapturesDir)) {
+        New-Item -ItemType Directory -Force -Path $Script:Cfg.CapturesDir | Out-Null
+    }
+    $outLog = Join-Path $Script:Cfg.CapturesDir 'capture-run.out.log'
+    $errLog = Join-Path $Script:Cfg.CapturesDir 'capture-run.err.log'
+    foreach ($f in @($outLog, $errLog)) {
+        try { Remove-Item $f -Force -ErrorAction SilentlyContinue } catch { }
+    }
+    # Python always expects a dot decimal separator; -f would use the local
+    # culture and turn 0.3 into 0,3 on a Russian Windows install.
+    $interval = ([double]$Script:Cfg.CaptureIntervalSec).ToString([Globalization.CultureInfo]::InvariantCulture)
+    $argLine = '"{0}" --seconds {1} --interval {2} --out "{3}"' -f $script, $Seconds, $interval, $Script:Cfg.CapturesDir
+    if ($py.prefix) { $argLine = $py.prefix + ' ' + $argLine }
+    try {
+        $proc = Start-Process -FilePath $py.exe -ArgumentList $argLine `
+            -WorkingDirectory $Script:Cfg.ToolDir -WindowStyle Hidden `
+            -RedirectStandardOutput $outLog -RedirectStandardError $errLog -PassThru
+    } catch {
+        Log ('continuous capture failed to start: ' + $_.Exception.Message)
+        return $false
+    }
+    $Script:Capture = @{
+        proc     = $proc
+        started  = Get-Date
+        seconds  = $Seconds
+        outLog   = $outLog
+        errLog   = $errLog
+        lastOut  = 0
+        lastErr  = 0
+        baseline = (Get-CaptureFileCount)
+    }
+    Log ("continuous capture ON for {0}s - run Happ -> ... -> Ping all now; press [U] to stop and import" -f $Seconds)
+    return $true
+}
+
+function Stop-CaptureMode {
+    param([switch]$NoImport)
+    if (-not $Script:Capture) { return }
+    $cap = $Script:Capture
+    try {
+        if ($cap.proc -and -not $cap.proc.HasExited) {
+            $cap.proc.Kill()
+            $null = $cap.proc.WaitForExit(5000)
+        }
+    } catch { }
+    Read-CaptureProcessOutput
+    $Script:Capture = $null
+    $count = Get-CaptureFileCount
+    $newCount = [Math]::Max(0, $count - [int]$cap.baseline)
+    Log ("continuous capture stopped: {0} capture file(s) on disk ({1} new)" -f $count, $newCount)
+    if ($NoImport) { return }
+    if ($newCount -le 0) {
+        Log 'no new captures - did you run Happ -> ... -> Ping all while capture was ON?'
+    }
+    $created = Import-CapturedProfiles
+    try { Update-ConfigCache | Out-Null } catch { Log ('cache refresh failed: ' + $_.Exception.Message) }
+    $cacheCount = @(Get-CachedServerList).Count
+    Log ("server cache refreshed: {0} entries; imported {1} new profile file(s) - press [L] to view the list" -f $cacheCount, $created)
+}
+
+function Update-CaptureMode {
+    if (-not $Script:Capture) { return }
+    Read-CaptureProcessOutput
+    $p = $Script:Capture.proc
+    if ($p -and $p.HasExited) {
+        Log ("capture scanner exited (code {0}) - importing captures" -f $p.ExitCode)
+        Stop-CaptureMode
+    }
+}
+
+function Show-CachedServers {
+    if (-not $Script:State) { Load-State }
+    $list = @(Get-CachedServerList | Sort-Object host, port, key)
+    $endpoints = @($list | ForEach-Object { '{0}:{1}' -f $_.host, $_.port } | Sort-Object -Unique).Count
+    $profiles = @($list | Where-Object { $_.profileHash }).Count
+    $active = Get-ActiveServer
+    $activeKey = $null
+    if ($active) { $activeKey = Get-ServerKey $active }
+    Write-Host ''
+    Write-Host ("cached servers: {0} ({1} endpoints, {2} profiles)" -f $list.Count, $endpoints, $profiles)
+    foreach ($srv in $list) {
+        $key = Get-ServerKey $srv
+        $name = ([string](Get-CachedServerName ([string]$srv.host) ([int]$srv.port) $key)).Trim()
+        $tags = @()
+        if ($activeKey -and $key -eq $activeKey) { $tags += 'active' }
+        if (Test-ServerBanned $key) { $tags += 'banned' }
+        try { if ($Script:State.used.PSObject.Properties[$key]) { $tags += 'used' } } catch { }
+        $suffix = ''
+        if ($tags.Count) { $suffix = '  [' + ($tags -join ', ') + ']' }
+        Write-Host ("{0,-46} {1}{2}" -f $key, $name, $suffix)
+    }
+    Write-Host ''
 }
 
 function Get-ServerFromCacheKey([string]$key) {
@@ -2779,15 +2998,23 @@ function Get-HeaderLines {
         if ($pri) { $elevated = $pri.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator) }
     } catch { }
     $tunnel = $(if ($xrayProc) { 'UP' } else { 'DOWN - no xray core' })
+    $uAction = 'update servers'
+    $captureStatus = 'off - [U] continuous server update'
+    if ($Script:Capture) {
+        $uAction = 'stop capture'
+        $elapsed = (Get-Date) - [datetime]$Script:Capture.started
+        $captureStatus = ('ON {0} - {1} files - run Happ -> ... -> Ping all; [U] stop + import' -f $elapsed.ToString('mm\:ss'), (Get-CaptureFileCount))
+    }
     return @(
         ('Happ Failover Watchdog        {0}                                elevated={1}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $elevated),
         ('=============================================================='),
         ('Happ GUI : {0}    xray core: {1}    owned connection: {2}' -f ($(if ($guiProc) { 'running' } else { 'NOT RUNNING' })), ($(if ($xrayProc) { 'running pid ' + $xrayProc.Id } else { 'not running' })), $owned),
         ('Server   : {0}{1}' -f (Format-ServerLabel $cur), $(if ($curBanned) { '   [BANNED]' } else { '' })),
         ('Tunnel   : {0}' -f $tunnel),
+        ('Capture  : {0}' -f $captureStatus),
         ('Exit IP  : {0}    (checked {1})' -f $exitIp, $exitWhen),
         ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    burned: {4}    last failover: {5}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $burnedCount, $global:LastFailover),
-        ('[T] switch now    [B] ban current    [L] bans editor    [R] rescan+revive    [C] clear used    [Q] quit'),
+        ('[T] switch now    [B] ban current    [L] bans editor    [R] rescan+revive    [U] {0}    [C] clear used    [Q] quit' -f $uAction),
         ('----------------------------------------------------------------')
     )
 }
@@ -3349,6 +3576,28 @@ function Write-ConsoleEvent([string]$msg) {
     if (-not $Script:SuppressRender) { Render-Frame }
 }
 
+if ($ListServers) {
+    Load-State
+    Show-CachedServers
+    return
+}
+
+if ($CaptureAll) {
+    Load-State
+    if (-not (Start-CaptureMode -Seconds $CaptureSeconds)) { return }
+    try {
+        $deadline = (Get-Date).AddSeconds([Math]::Max(1, $CaptureSeconds))
+        while ((Get-Date) -lt $deadline -and $Script:Capture -and $Script:Capture.proc -and -not $Script:Capture.proc.HasExited) {
+            Update-CaptureMode
+            Start-Sleep -Seconds 1
+        }
+    } finally {
+        if ($Script:Capture) { Stop-CaptureMode | Out-Null }
+    }
+    Show-CachedServers
+    return
+}
+
 if ($Watch) {
     Load-State
     $global:LastFailover = Get-Date
@@ -3401,6 +3650,7 @@ if ($Watch) {
     try { $host.UI.RawUI.WindowTitle = 'Happ Failover Watchdog' } catch { }
     while ($true) {
         try {
+            Update-CaptureMode
             Load-Bans
             $fails = Test-OpLogTail
             $now = Get-Date
@@ -3552,6 +3802,13 @@ if ($Watch) {
                                     Log 'revive pass: no failed sessions found'
                                 }
                             }
+                            'U' {
+                                if ($Script:Capture) {
+                                    Stop-CaptureMode
+                                } else {
+                                    Start-CaptureMode | Out-Null
+                                }
+                            }
                             'C' {
                                 Log 'used-server list cleared [C] - all non-banned cached servers are candidates again (bans unchanged)'
                                 $Script:State | Add-Member -NotePropertyName used -NotePropertyValue (New-Object PSObject) -Force
@@ -3559,6 +3816,7 @@ if ($Watch) {
                             }
                             'Q' {
                                 Log 'quit requested [Q] - releasing owned core and TUN (the network drops if we own the tunnel; the next launch auto-recovers)'
+                                if ($Script:Capture) { Stop-CaptureMode -NoImport | Out-Null }
                                 if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
                                 try { if ($Script:OwnedClient) { $Script:OwnedClient.Dispose() } } catch { }
                                 try { $mutex.ReleaseMutex() } catch { }
@@ -3577,4 +3835,4 @@ if ($Watch) {
     }
 }
 
-Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ListBurned / -UnburnSession ses_id"
+Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -CaptureAll [-CaptureSeconds N] / -ListServers / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ListBurned / -UnburnSession ses_id"
