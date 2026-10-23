@@ -59,11 +59,25 @@ def ident_hash(outbound):
     return hashlib.sha256(canonical(outbound).encode("utf-8")).hexdigest()[:12]
 
 
+def usable_host(host):
+    value = str(host or "").strip().lower()
+    if not value or value in ("0.0.0.0", "::", "localhost", "auto-wifi.local"):
+        return False
+    if value.startswith("127.") or any(ch.isspace() for ch in value):
+        return False
+    return True
+
+
 def endpoints(outbound):
     settings = outbound.get("settings") or {}
     result = []
     for vnext in settings.get("vnext") or []:
-        if isinstance(vnext, dict) and vnext.get("address") and vnext.get("port"):
+        if (
+            isinstance(vnext, dict)
+            and vnext.get("address")
+            and vnext.get("port")
+            and usable_host(vnext.get("address"))
+        ):
             result.append((str(vnext["address"]), int(vnext["port"])))
     return result
 

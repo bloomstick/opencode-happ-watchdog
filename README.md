@@ -176,6 +176,8 @@ single-server outbound whose credentials/transport differ from the endpoint's pr
 config. It never overwrites an existing cache file. Multi-outbound group captures are
 skipped because they represent a routing group rather than one server; their display
 name is still imported as a normal `~` alias by the watchdog's memory rescan.
+Placeholder hosts such as `auto-wifi.local`, `0.0.0.0`, and loopback addresses are
+ignored because they cannot be used as a concrete proxy endpoint.
 
 Two examples from a real subscription: India and Portugal share
 `185.147.27.235:443` with different UUIDs, and Kazakhstan, Italy, and Australia share
