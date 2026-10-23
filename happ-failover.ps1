@@ -89,7 +89,7 @@ $Script:Cfg = @{
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
-    FastRetrySec       = 8     # shorter cooldown for another timeout shortly after a switch
+    FastRetrySec       = 8     # shorter cooldown for another failure shortly after a switch
     ConsecutiveWindowSec = 180 # how long a follow-up failure counts as a consecutive timeout
     FastVerifyTries    = 2     # verification attempts after a fast switch
     FastVerifyTimeoutSec = 4   # curl timeout per fast verification attempt
@@ -1859,6 +1859,7 @@ function Invoke-PipeSwitch {
     }
     if ($exitIpAfter) {
         Log ("SWITCH OK -> {0}:{1} (core exit IP: {2}{3}; system route: {4})" -f $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
+        $global:LastSwitchAt = Get-Date
         Update-Reliability (Get-ServerKey $Target) $true $exitIpAfter
         Set-ActiveServer $Target
         return $true
@@ -2353,8 +2354,10 @@ function Resume-FailedSession {
         }
     }
 
+    # Stamp the prompt before sending: a provider error written while the CLI
+    # call is still in flight must still count as a response to this continue.
+    $now = (Get-Date).ToString('o')
     if (Send-ContinueToSession -sessionID $target) {
-        $now = (Get-Date).ToString('o')
         Add-Member -InputObject $Script:State.prompted -NotePropertyName $target -NotePropertyValue $now -Force
         $tr = Get-SessionRec $target
         if (-not $tr) {
@@ -2399,6 +2402,10 @@ function Invoke-Failover {
     param([string]$Reason = 'auto', [switch]$Fast)
     Load-State
     $global:LastFailover = Get-Date
+    # A failover that aborts before its prompt phase must not leave the previous
+    # phase's window in place for instant-timeout classification.
+    $global:FailoverPromptStart = $null
+    $global:FailoverPromptEnd = $null
     $cur = Get-ActiveServer
     if ($cur) {
         if ($Reason -eq 'quota') {
@@ -2532,19 +2539,28 @@ function Invoke-Failover {
     }
 
     $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.AffectedWindowMin -kinds @('rate','endpoint','connreset','timeout')
-    $seen = @{}
-    foreach ($s in (@($affected) + @($postReload))) {
-        if ($seen.ContainsKey($s.id)) { continue }
-        $seen[$s.id] = $true
-        if ($s.kind -eq 'rate') {
-            $props = $Script:State.prompted.PSObject.Properties[$s.id]
-            if ($props) {
-                $fresh = $false
-                try { if ($s.errCreated -gt ([DateTimeOffset]::Parse($props.Value).ToUnixTimeMilliseconds())) { $fresh = $true } } catch { }
-                if (-not $fresh) { continue }
+    # Only continues sent during this failover's prompt phase are "connect ->
+    # continue" evidence against the freshly selected server. A later revive or
+    # endpoint-retry continue on a long-running server must not ban it.
+    $global:FailoverPromptStart = Get-Date
+    $global:FailoverPromptEnd = $null
+    try {
+        $seen = @{}
+        foreach ($s in (@($affected) + @($postReload))) {
+            if ($seen.ContainsKey($s.id)) { continue }
+            $seen[$s.id] = $true
+            if ($s.kind -eq 'rate') {
+                $props = $Script:State.prompted.PSObject.Properties[$s.id]
+                if ($props) {
+                    $fresh = $false
+                    try { if ($s.errCreated -gt ([DateTimeOffset]::Parse($props.Value).ToUnixTimeMilliseconds())) { $fresh = $true } } catch { }
+                    if (-not $fresh) { continue }
+                }
             }
+            Resume-FailedSession -Session $s -Reason $Reason | Out-Null
         }
-        Resume-FailedSession -Session $s -Reason $Reason | Out-Null
+    } finally {
+        $global:FailoverPromptEnd = Get-Date
     }
     Log 'failover complete'
 }
@@ -2553,7 +2569,6 @@ function Invoke-Failover {
 function Test-OpLogTail {
     if (-not (Test-Path $Script:Cfg.OpLogPath)) { return $null }
     $lines = Get-Content $Script:Cfg.OpLogPath -Tail 300 -ErrorAction SilentlyContinue
-    $windowStart = $global:LastFailover.AddSeconds(15)
     $rateNewest = $null
     $quotaNewest = $null
     $endNewest = $null
@@ -2580,7 +2595,6 @@ function Test-OpLogTail {
 # session. Failures at or before state.connResetUntil / state.timeoutUntil were
 # already processed.
 function Test-SessionFailureScan {
-    param([int64]$TimeoutFloorMs = 0)
     $result = [pscustomobject]@{ connReset = 0; timeouts = @() }
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { return $result }
@@ -2591,7 +2605,6 @@ function Test-SessionFailureScan {
     try { $processedMs = [int64][string]$Script:State.connResetUntil } catch { $processedMs = 0 }
     $toProcessedMs = 0
     try { $toProcessedMs = [int64][string]$Script:State.timeoutUntil } catch { $toProcessedMs = 0 }
-    if ($TimeoutFloorMs -gt $toProcessedMs) { $toProcessedMs = $TimeoutFloorMs }
     # sessions untouched for longer than this cannot contain a fresh failure
     $updFloorMs = $nowMs - ([Math]::Max([int]$Script:Cfg.ConnResetWindowSec, 600) * 1000)
     $count = 0
@@ -2628,18 +2641,28 @@ function Test-SessionFailureScan {
     return $result
 }
 
-# A timeout is "instant" when it arrives shortly after the watchdog's own
-# continue prompt for that session: connect -> continue -> timeout. That points
-# at the freshly selected server, so it is worth banning. A timeout after the
-# session had been running for a while is ordinary provider behaviour: mark the
-# server used and switch, but keep the server for later rotation.
+# A timeout is "instant" when it arrives shortly after a continue prompt sent
+# during the latest failover: connect -> continue -> timeout. That points at the
+# freshly selected server, so it is worth banning. A timeout after the server
+# had been running for a while is ordinary provider behaviour: mark the server
+# used and switch, but keep the server for later rotation. The prompt must fall
+# inside the latest failover's prompt phase; a revive/endpoint retry continue on
+# a long-running server must never trigger a ban.
 function Test-TimeoutWasInstant([object]$failure) {
     if (-not $failure) { return $false }
+    if (-not $global:FailoverPromptStart -or -not $global:FailoverPromptEnd) { return $false }
     $pr = $null
     try { $pr = $Script:State.prompted.PSObject.Properties[[string]$failure.sessionID] } catch { }
     if (-not $pr) { return $false }
     $promptMs = 0
-    try { $promptMs = [DateTimeOffset]::Parse([string]$pr.Value).ToUnixTimeMilliseconds() } catch { return $false }
+    $startMs = 0
+    $endMs = 0
+    try {
+        $promptMs = [DateTimeOffset]::Parse([string]$pr.Value).ToUnixTimeMilliseconds()
+        $startMs = ([DateTimeOffset]$global:FailoverPromptStart).ToUnixTimeMilliseconds()
+        $endMs = ([DateTimeOffset]$global:FailoverPromptEnd).ToUnixTimeMilliseconds()
+    } catch { return $false }
+    if ($promptMs -lt $startMs -or $promptMs -gt $endMs) { return $false }
     $ageSec = ([double]$failure.created - [double]$promptMs) / 1000.0
     if ($ageSec -lt 0) { return $false }
     return ($ageSec -le [int]$Script:Cfg.TimeoutInstantSec)
@@ -3648,6 +3671,9 @@ if ($CaptureAll) {
 if ($Watch) {
     Load-State
     $global:LastFailover = Get-Date
+    $global:LastSwitchAt = $global:LastFailover
+    $global:FailoverPromptStart = $null
+    $global:FailoverPromptEnd = $null
     # Ignore timeout errors that predate this watchdog run: old sessions are
     # not evidence against the currently selected server.
     try {
@@ -3711,7 +3737,10 @@ if ($Watch) {
             # failover start, not a fixed 15s margin; otherwise a quota error
             # arriving seconds after a switch could be ignored forever.
             if ($fails.rate -and $fails.rate -gt $global:LastFailover) {
-                $quotaError = ($fails.quota -and $fails.rate -and $fails.quota -ge $fails.rate)
+                # A quota line is dominant even when a newer generic rate line
+                # follows it: the free window is exhausted, so the orange ban
+                # must not be skipped. Both timestamps are after LastFailover.
+                $quotaError = ($fails.quota -and $fails.rate -and $fails.quota -gt $global:LastFailover)
                 $switchCool = Get-SwitchCooldownSec
                 if ($quotaError -or $now -gt $global:LastFailover.AddSeconds($switchCool)) {
                     if ($quotaError) {
@@ -3737,8 +3766,15 @@ if ($Watch) {
             if ($null -eq $Script:ConnResetLast -or ((Get-Date) - $Script:ConnResetLast).TotalSeconds -ge $Script:Cfg.ConnResetScanSec) {
                 $Script:ConnResetLast = Get-Date
                 $scan = Test-SessionFailureScan
-                $lastFailoverMs = ([DateTimeOffset]$global:LastFailover).ToUnixTimeMilliseconds()
-                $newTimeouts = @($scan.timeouts | Where-Object { $_ -and [int64]$_.created -gt $lastFailoverMs })
+                # Only timeouts newer than the current server generation can be
+                # evidence against it. The switch timestamp also excludes errors
+                # from the previous server while it was shutting down. A later
+                # failover attempt that never switched advances LastFailover and
+                # therefore raises the floor as well.
+                $epoch = $global:LastFailover
+                if ($global:LastSwitchAt -and $global:LastSwitchAt -gt $epoch) { $epoch = $global:LastSwitchAt }
+                $epochMs = ([DateTimeOffset]$epoch).ToUnixTimeMilliseconds()
+                $newTimeouts = @($scan.timeouts | Where-Object { $_ -and [int64]$_.created -gt $epochMs })
                 $instantTimeout = $null
                 $newestTimeout = $null
                 foreach ($to in $newTimeouts) {
@@ -3748,8 +3784,7 @@ if ($Watch) {
                 $timeoutHandled = $false
                 if ($instantTimeout) {
                     Log ("timeout immediately after continue in {0} - auto-banning current server and fast switching" -f $instantTimeout.sessionID)
-                    $until = [int64]$instantTimeout.created
-                    try { $until = [Math]::Max($until, [int64][string]$Script:State.timeoutUntil) } catch { }
+                    $until = [int64]$newestTimeout.created
                     Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
                     Save-State
                     $timeoutHandled = $true
@@ -3758,7 +3793,6 @@ if ($Watch) {
                     if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
                         Log ("timeout in {0} after the server had been in use - marking it used and switching (no ban)" -f $newestTimeout.sessionID)
                         $until = [int64]$newestTimeout.created
-                        try { $until = [Math]::Max($until, [int64][string]$Script:State.timeoutUntil) } catch { }
                         Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
                         Save-State
                         $timeoutHandled = $true

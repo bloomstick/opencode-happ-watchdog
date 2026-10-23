@@ -68,7 +68,7 @@ separate `bans.json`; clearing the used list never un-bans anything.
 Automatic failures use a **fast path**: no cache rescan when the cache is already
 populated, no pre-switch session scan (the post-reload scan still runs), a short
 OpenCode close grace, shorter daemon/TUN waits, two 4-second exit checks instead of
-the full verify, and no plain-route probe. If another timeout arrives within 180
+the full verify, and no plain-route probe. If another failure arrives within 180
 seconds of a switch, the next switch may start after only **8 seconds** instead of
 the normal two-minute cooldown. Quota errors bypass the cooldown entirely. Manual
 `T`/`B` actions keep the thorough path.
@@ -81,7 +81,7 @@ the normal two-minute cooldown. Quota errors bypass the cooldown entirely. Manua
 | quota | exact `Free usage limit reached. Subscribe to OpenCode Go to keep going: https://opencode.ai/go` in the log | **auto-ban current server (orange)** + immediate fast failover, bypassing cooldown |
 | endpoint | session API (`Endpoint is unavailable`) | same-server `continue` retry after ~60s; switch after 2 failed rounds |
 | connreset | session API (`ECONNRESET` / `Connection lost while reading the response`) | **3 failures within 3 minutes -> failover** |
-| timeout | session API (`Timed out waiting for response data`, `TimeoutError`, `ETIMEDOUT`) | failover; **auto-ban only when the timeout lands within 120s of our `continue`** (connect -> continue -> immediate timeout = bad server). A timeout after the server worked for a while only marks it **used**, no ban |
+| timeout | session API (`Timed out waiting for response data`, `TimeoutError`, `ETIMEDOUT`) | failover; **auto-ban only when the timeout follows a `continue` from the latest failover within 120s** (fresh server, first request). A timeout after the server worked for a while - or after a revive/endpoint-retry `continue` - only marks it **used**, no ban |
 | tunnel-dead | plain system-route probes (two URLs, 30s cadence) | route dead twice in a row (~60s) -> failover; a vanished TUN adapter is restored directly |
 
 Notable behaviors:
@@ -111,10 +111,11 @@ create a ban. Automatic quota bans are stored as objects in `bans.json`
 manual. An existing manual ban is never rewritten by the automatic path.
 
 Provider timeouts are treated more carefully because they also occur on healthy
-servers. A timeout is automatically banned only when it arrives **immediately after
-the watchdog's own `continue`** (within `TimeoutInstantSec`, default 120s) - that is
-the connect -> continue -> timeout pattern of a server that cannot sustain the first
-request. If the session had been working for some time before the timeout, the server
+servers. A timeout auto-bans the current server only when it arrives **immediately
+after a `continue` sent during the latest failover** (within `TimeoutInstantSec`,
+default 120s) - the connect -> continue -> timeout pattern of a server that cannot
+sustain the first request. If the server had been working for some time before the
+timeout, or the timeout follows a later revive/endpoint-retry `continue`, the server
 is only marked **used** and rotated away; it is not banned.
 
 ### Server exhaustion / rotation
@@ -428,8 +429,9 @@ Top of `happ-failover.ps1`, the `$Script:Cfg` block (see the file for descriptio
   every eligible server in random order
 - `RateLimitPattern`, `EndpointPattern`, `ConnResetPattern`, `TimeoutPattern` - error classifiers
 - `ConnResetWindowSec` / `ConnResetMinCount` / `ConnResetScanSec` - burst thresholds
-- `TimeoutInstantSec` - a provider timeout within this many seconds of our `continue`
-  auto-bans the fresh server (default 120s); later timeouts only mark it used
+- `TimeoutInstantSec` - a provider timeout within this many seconds of a `continue`
+  sent during the same failover auto-bans the freshly selected server (default 120s);
+  later timeouts only mark it used
 - `TunnelScanSec`, `ProbeUrl2`, `ProbeTimeoutSec` - route-health probe settings
 - `CaptureWindowSec` / `CaptureIntervalSec` - `[U]` capture window (default 1800s,
   `U` stops earlier) and pause between memory scans (default 0.3s)
