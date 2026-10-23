@@ -201,7 +201,10 @@ The displayed server name is read from the cached config's `remarks` field. If b
 state and the registry are blank (for example right after an upgrade), the watchdog
 identifies the server from the core's dominant established connection to a cached
 endpoint and records that once (profile identity cannot be inferred from the socket
-alone, so it falls back to the endpoint).
+alone, so it falls back to the endpoint). Cached domain endpoints are resolved to
+their A records for this comparison. If saved state exists but the core has been
+running on a different endpoint for more than a minute, the watchdog corrects the
+saved active server instead of continuing to trust stale state.
 
 This is also why the dashboard can show a different server than the Happ window after a
 failover - the watchdog is right about the traffic path, and the GUI is still showing

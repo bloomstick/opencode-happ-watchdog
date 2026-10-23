@@ -334,6 +334,30 @@ function Get-ActiveServer {
             $changed = $true
             Log ("active server inferred from running core: {0} ({1} live connections)" -f (Format-ServerLabel $active), $live.connections)
         }
+    } elseif (-not $reg -or -not $reg.host) {
+        # Saved state can outlive a Happ restart or a manual reconnect. If the
+        # registry is blank, compare the active endpoint with the dominant live
+        # connection and adopt it after a short settling period. Keep the saved
+        # profile key when only the profile identity differs.
+        $live = Get-LiveServerFromCore
+        if ($live) {
+            $activeKey = Get-ServerKey $active
+            $activeBase = $activeKey
+            if ($activeBase -match '#[0-9a-fA-F]+$') { $activeBase = $activeBase -replace '#[0-9a-fA-F]+$', '' }
+            $liveKey = ('{0}:{1}' -f $live.host, $live.port)
+            $age = 9999.0
+            try {
+                if ($active.since) {
+                    $age = ((Get-Date) - [datetime]::Parse([string]$active.since)).TotalSeconds
+                }
+            } catch { }
+            if ($activeBase -ne $liveKey -and $age -gt 60 -and [int]$live.connections -ge 5) {
+                $active = New-ActiveRecord $live 'live'
+                $adoptedLive = $true
+                $changed = $true
+                Log ("active server corrected from running core: {0} ({1} live connections)" -f (Format-ServerLabel $active), $live.connections)
+            }
+        }
     }
     if ($reg -and $reg.host -and (-not $active -or ($regChanged -and -not $adoptedLive))) {
         # If the registry name matches a captured profile (e.g. a country on
@@ -1071,6 +1095,50 @@ function Add-CacheAlias([string]$file, [string]$name) {
     }
 }
 
+function Get-CachedEndpointIpMap {
+    # Resolve cached domain endpoints so live xray connections (which use IPs)
+    # can be mapped back to host:port keys. Do this rarely; DNS can be slow.
+    $now = Get-Date
+    try {
+        if ($Script:EndpointIpMap -and $Script:EndpointIpMapAt -and
+            ($now - $Script:EndpointIpMapAt).TotalMinutes -lt 10) {
+            return $Script:EndpointIpMap
+        }
+    } catch { }
+
+    $byHost = @{}
+    try {
+        Get-ChildItem -Path $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction Stop | ForEach-Object {
+            $srv = Get-ServerFromCacheKey $_.BaseName
+            if (-not $srv -or $srv.profileHash) { return }
+            $h = [string]$srv.host
+            if (-not $h -or $h -match '^\d{1,3}(\.\d{1,3}){3}$' -or $h -match ':') { return }
+            if ($h -in @('auto-wifi.local','auto-lte.local','localhost')) { return }
+            if (-not $byHost.ContainsKey($h)) { $byHost[$h] = New-Object System.Collections.Generic.List[int] }
+            if (-not $byHost[$h].Contains([int]$srv.port)) { $byHost[$h].Add([int]$srv.port) }
+        }
+    } catch { return @{} }
+
+    $map = @{}
+    foreach ($h in @($byHost.Keys)) {
+        $ips = @()
+        try {
+            $ips = @(Resolve-DnsName -Name $h -Type A -DnsOnly -QuickTimeout -ErrorAction Stop |
+                Where-Object { $_.IPAddress } | ForEach-Object { [string]$_.IPAddress })
+        } catch { $ips = @() }
+        foreach ($ip in $ips) {
+            foreach ($port in @($byHost[$h])) {
+                $k = ('{0}:{1}' -f $ip, $port)
+                if (-not $map.ContainsKey($k)) { $map[$k] = ('{0}:{1}' -f $h, $port) }
+                elseif ($map[$k] -ne ('{0}:{1}' -f $h, $port)) { $map[$k] = $null }
+            }
+        }
+    }
+    $Script:EndpointIpMap = $map
+    $Script:EndpointIpMapAt = $now
+    return $map
+}
+
 function Get-LiveServerFromCore {
     # Best-effort fallback for when state and the Happ registry are both blank:
     # xray keeps many TCP connections to the server it is actually proxying
@@ -1085,9 +1153,9 @@ function Get-LiveServerFromCore {
     $cached = @{}
     try {
         Get-ChildItem -Path $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction Stop | ForEach-Object {
-            if ($_.BaseName -match '^(.+)_(\d+)$') {
-                $cached[($Matches[1] + ':' + $Matches[2])] = $true
-            }
+            $srv = Get-ServerFromCacheKey $_.BaseName
+            if (-not $srv -or $srv.profileHash) { return }
+            $cached[('{0}:{1}' -f $srv.host, $srv.port)] = $true
         }
     } catch { return $null }
     if ($cached.Count -eq 0) { return $null }
@@ -1095,6 +1163,7 @@ function Get-LiveServerFromCore {
     $procs = @(Get-Process xray -ErrorAction SilentlyContinue)
     if (-not $procs) { return $null }
 
+    $allCounts = @{}
     $counts = @{}
     foreach ($proc in $procs) {
         try {
@@ -1104,8 +1173,31 @@ function Get-LiveServerFromCore {
             if (-not $c.RemoteAddress) { continue }
             $addr = ([string]$c.RemoteAddress) -replace '^::ffff:', ''
             $key = ('{0}:{1}' -f $addr, [int]$c.RemotePort)
+            if ($allCounts.ContainsKey($key)) { $allCounts[$key]++ } else { $allCounts[$key] = 1 }
             if (-not $cached.ContainsKey($key)) { continue }
             if ($counts.ContainsKey($key)) { $counts[$key]++ } else { $counts[$key] = 1 }
+        }
+    }
+    if ($allCounts.Count -eq 0) { return $null }
+
+    $needDns = ($counts.Count -eq 0)
+    if (-not $needDns) {
+        foreach ($entry in @($allCounts.GetEnumerator())) {
+            if (-not $cached.ContainsKey([string]$entry.Key) -and [int]$entry.Value -ge 2) {
+                $needDns = $true
+                break
+            }
+        }
+    }
+    if ($needDns) {
+        $ipMap = Get-CachedEndpointIpMap
+        foreach ($entry in @($allCounts.GetEnumerator())) {
+            if ($cached.ContainsKey([string]$entry.Key)) { continue }
+            $mapped = $null
+            if ($ipMap -and $ipMap.ContainsKey([string]$entry.Key)) { $mapped = $ipMap[[string]$entry.Key] }
+            if (-not $mapped) { continue }
+            if ($counts.ContainsKey($mapped)) { $counts[$mapped] += [int]$entry.Value }
+            else { $counts[$mapped] = [int]$entry.Value }
         }
     }
     if ($counts.Count -eq 0) { return $null }
