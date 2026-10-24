@@ -3,8 +3,9 @@
 .SYNOPSIS
   happ-failover watchdog: on OpenCode rate-limit errors (provider limits plus the
   per-IP free usage limit listed in the RateLimitPattern), switch Happ to a random
-  previously unused, unbanned server (via the happd named-pipe protocol), fully restart
-  the OpenCode desktop app (stop before changing the server, start after), and send
+  previously unused, unbanned server (via the happd named-pipe protocol), restart the
+  OpenCode background service (or, with RestartOpenCodeApp, fully restart the OpenCode
+  desktop app: stop before changing the server, start after), and send
   "continue" prompts to the affected top-level sessions.
 
 .DESCRIPTION
@@ -25,8 +26,13 @@
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnbanServer host:port
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBanned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ForkSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ResumeSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ResumeStale
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -SessionMenu
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBurned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnburnSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListIgnored
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnignoreSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -CaptureAll [-CaptureSeconds 120]
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListServers
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -Watch [-Interactive] [-ProjectDir <dir>]
@@ -43,8 +49,13 @@ param(
     [string]$UnbanServer,
     [switch]$ListBanned,
     [string]$ForkSession,
+    [string]$ResumeSession,
+    [switch]$ResumeStale,
+    [switch]$SessionMenu,
     [string]$UnburnSession,
     [switch]$ListBurned,
+    [switch]$ListIgnored,
+    [string]$UnignoreSession,
     [switch]$CaptureAll,
     [switch]$ListServers,
     [int]$CaptureSeconds = 120,
@@ -77,6 +88,7 @@ $Script:Cfg = @{
     EndpointPattern   = 'Endpoint is unavailable'
     ContinueDelaySec  = 5     # wait after app/service (re)connect before continue prompts
     RestartOpenCode   = $true
+    RestartOpenCodeApp = $false # $true = full desktop stop/start on failover (old behaviour); default: leave the desktop app running and restart only the background service
     TopLevelOnly      = $true
     # A session that was in flight when a server switch happened must not be
     # prompted again on the new exit IP: a session already flagged by the
@@ -84,8 +96,11 @@ $Script:Cfg = @{
     # watchdog forks every session it is about to resume (local DB copy, no
     # provider request), tags the old one [burned], and prompts the fork.
     SessionForkEnabled = $true
-    SessionForkMaxDepth = 6     # fork-of-fork chain cap for one root session
+    SessionForkMaxDepth = 15    # fork-of-fork chain cap for one root session (manual UI fork ignores it)
     SessionForkMaxPerHour = 30  # safety valve against a switch/fork runaway
+    RateCanaryText     = '.'    # canary prompt sent to a brand-new session to test the freshly selected server
+    RateCanaryWaitSec  = 20     # how long to wait for the canary response before the verdict is 'timeout'
+    RateCanaryMaxAttempts = 3   # canary rounds per failover; each instant HIT auto-bans its server and switches again before any fork
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
@@ -95,6 +110,10 @@ $Script:Cfg = @{
     FastVerifyTimeoutSec = 4   # curl timeout per fast verification attempt
     TunExe             = 'C:\Program Files\FlyFrogLLC\Happ\tun\sing-box.exe'
     TunConfigPath      = (Join-Path $env:LOCALAPPDATA 'Happ\config.json')
+    # The TUN config forwards system traffic to this local socks port. Captured
+    # Happ templates can carry arbitrary per-session ports, so generated configs
+    # are normalized to the port the TUN actually uses (read from TunConfigPath).
+    SocksPort         = 10808
     TunIface           = 'happ-tun'
     TunAddress         = '172.18.0.1/30'
     TunAddressV6       = 'fd6e:a81b:704f:1211::2'
@@ -140,6 +159,12 @@ $Script:PendingWinAt = $null
 $Script:BansEditor = $null
 $Script:SuppressRender = $false
 $Script:Capture = $null
+# ANSI orange for automatic bans. Windows Terminal / modern conhost render
+# 256-color escapes; ConsoleColor.DarkYellow is pale yellow there, not orange.
+$Script:Esc = [string][char]27
+$Script:AnsiReset = $Script:Esc + '[0m'
+$Script:AnsiColor = $false
+try { $Script:AnsiColor = [bool]$Host.UI.SupportsVirtualTerminal } catch { $Script:AnsiColor = $false }
 
 function Log([string]$msg) {
     $line = '{0} {1}' -f (Get-Date -Format 'HH:mm:ss'), $msg
@@ -290,8 +315,8 @@ function Get-ServerBanInfo([string]$key) {
     return $info
 }
 function Add-AutoBannedServer([string]$key, [string]$reason = 'free usage limit') {
-    # Keep a manual ban manual if it already exists; otherwise create a
-    # quota-specific exact ban (even when an endpoint wildcard covers a profile).
+    # Keep a manual ban manual if it already exists; otherwise create an exact
+    # ban for the current server (even when an endpoint wildcard covers a profile).
     if (-not $key) { return $false }
     Load-Bans
     if ($Script:Bans.PSObject.Properties[$key]) {
@@ -1681,9 +1706,47 @@ function Get-CurrentTemplate {
 }
 
 # ------------------------------------------------------------------- config builder
+function Get-TunSocksPort {
+    # Source of truth for the local socks port is the TUN config that sing-box
+    # reads: its socks outbound points at the xray inbound. Never assume a
+    # captured Happ template kept the same port - some sessions use 11231,
+    # 10870, etc. If xray listens on a different port than the TUN forwards to,
+    # every switch verifies against a dead port and the whole route is dead.
+    $fallback = [int]$Script:Cfg.SocksPort
+    try {
+        if (Test-Path $Script:Cfg.TunConfigPath) {
+            $tunCfg = Get-Content $Script:Cfg.TunConfigPath -Raw -Encoding utf8 | ConvertFrom-Json
+            foreach ($ob in @($tunCfg.outbounds)) {
+                if (-not $ob -or $ob.type -ne 'socks' -or -not $ob.server_port) { continue }
+                $port = 0
+                if ([int]::TryParse([string]$ob.server_port, [ref]$port) -and $port -ge 1 -and $port -le 65535) {
+                    return $port
+                }
+            }
+        }
+    } catch { }
+    return $fallback
+}
+
+function Set-ConfigSocksPort {
+    # Return a deep copy of a config whose socks inbounds listen on the port the
+    # TUN forwards to. Used for both the new config and the revert config, so a
+    # failed switch can still restore a working tunnel.
+    param([object]$Config)
+    $cfg = $Config | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+    $socksPort = Get-TunSocksPort
+    foreach ($ib in @($cfg.inbounds)) {
+        if ($ib -and $ib.protocol -eq 'socks') {
+            $ib | Add-Member -NotePropertyName listen -NotePropertyValue '127.0.0.1' -Force
+            $ib | Add-Member -NotePropertyName port -NotePropertyValue $socksPort -Force
+        }
+    }
+    return $cfg
+}
+
 function Build-Config {
     param([object]$Template, [object]$NewOutbound)
-    $cfg = $Template | ConvertTo-Json -Depth 30 | ConvertFrom-Json
+    $cfg = Set-ConfigSocksPort $Template
     $newParts = New-Object System.Collections.Generic.List[object]
     foreach ($ob in $cfg.outbounds) {
         $isServer = ($ob.protocol -in @('vless','hysteria','vmess','trojan')) -and ($ob.settings)
@@ -1702,9 +1765,11 @@ function Build-Config {
 function Test-ProxyExit {
     param([int]$tries = 4, [int]$TimeoutSec = 10, [int]$RetryDelayMs = 2000)
     $maxTime = [Math]::Max(1, [int]$TimeoutSec)
+    $socksPort = Get-TunSocksPort
+    $socksAddr = '127.0.0.1:' + $socksPort
     for ($i = 1; $i -le $tries; $i++) {
         try {
-            $raw = & curl.exe -s --max-time $maxTime --socks5-hostname 127.0.0.1:10808 $Script:Cfg.WebCheckUrl 2>$null
+            $raw = & curl.exe -s --max-time $maxTime --socks5-hostname $socksAddr $Script:Cfg.WebCheckUrl 2>$null
             if ($LASTEXITCODE -eq 0) {
                 $joined = ($raw -join '')
                 $ip = $null
@@ -1820,7 +1885,7 @@ function Invoke-PipeSwitch {
 
     $newCfg = Build-Config -Template $template -NewOutbound $newOut
     $newJson = ConvertTo-Json -InputObject $newCfg -Compress -Depth 30
-    $oldJson = ConvertTo-Json -InputObject $template -Compress -Depth 30
+    $oldJson = ConvertTo-Json -InputObject (Set-ConfigSocksPort $template) -Compress -Depth 30
 
     Log ("switching to {0}:{1} via daemon pipe (burst mode{2})..." -f $Target.host, $Target.port, $(if ($Fast) { ', fast' } else { '' }))
     $exitIpBefore = ''
@@ -1866,7 +1931,7 @@ function Invoke-PipeSwitch {
         return $true
     }
     Update-Reliability (Get-ServerKey $Target) $false
-    Log 'exit check failed on the new server - reverting to original config'
+    Log 'exit check failed on the new server - checking whether the original config can be restored'
     if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
     $Script:OwnedClient = $null; $Script:OwnedBurst = $null
     $null = Invoke-KillCore
@@ -1875,7 +1940,14 @@ function Invoke-PipeSwitch {
         # template whose server is not the real active server. In either case
         # the next failover attempt can start cleanly from another cached config.
         if ($curBanned) {
-            Log 'original server is banned - refusing to revert; no proxy is active'
+            $banReason = ''
+            if ($curSrv) {
+                try {
+                    $bi = Get-ServerBanInfo (Get-ServerKey $curSrv)
+                    if ($bi -and $bi.reason) { $banReason = ' (' + [string]$bi.reason + ')' }
+                } catch { }
+            }
+            Log ('original server is banned{0} - refusing to revert; no proxy is active; trying the next candidate' -f $banReason)
         } else {
             Log 'original server config was not cached - refusing to revert to a fallback template; no proxy is active'
         }
@@ -1912,20 +1984,33 @@ function Invoke-OC {
 }
 
 function Get-FailedSessions {
-    param([int]$windowMinutes = 120, [int]$freshMinutes = 0, [string[]]$kinds = @('rate','endpoint','connreset','timeout'))
+    param(
+        [int]$windowMinutes = 120,
+        [int]$freshMinutes = 0,
+        [string[]]$kinds = @('rate','endpoint','connreset','timeout'),
+        [string]$SessionID = '',
+        [switch]$IncludePrompted,
+        [switch]$AllAges
+    )
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { Log 'cannot list opencode sessions'; return @() }
     $cutoff = (Get-Date).AddMinutes(-1 * $windowMinutes)
     $result = @()
     foreach ($s in $root.data) {
+        if ($SessionID -and [string]$s.id -ne $SessionID) { continue }
         if ($Script:Cfg.TopLevelOnly -and $s.parentID) { continue }
-        # Burned sessions are never prompted again; their fork carries the work.
-        if (Test-SessionBurned $s.id) { continue }
+        # Burned and ignored sessions are never prompted again; their fork
+        # carries the work. An explicit -ResumeSession may name the session so
+        # the resume helper can follow a recorded fork or override an ignore.
+        if (-not $SessionID -and (Test-SessionSuppressed $s.id)) { continue }
+        # The [burned] title is a second guard for a lost/overwritten state file;
+        # explicit -ResumeSession may still name the session.
+        if (-not $SessionID -and ([string]$s.title -match '^\[burned\]')) { continue }
         $updated = $null
         if ($s.time -and $s.time.updated) {
             try { $updated = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$s.time.updated).LocalDateTime } catch { }
         }
-        if ($updated -and $updated -lt $cutoff) { continue }
+        if (-not $SessionID -and -not $AllAges -and $updated -and $updated -lt $cutoff) { continue }
         $msgsResp = Invoke-OC ("/api/session/{0}/message?order=desc&limit=25" -f $s.id)
         if (-not $msgsResp -or -not $msgsResp.data) { continue }
         # Walk newest -> oldest. Only a person-authored follow-up (non-empty text,
@@ -1966,7 +2051,7 @@ function Get-FailedSessions {
         # That copied error must not count as a fresh failure of the fork; only
         # messages created after the fork itself can trigger another burn.
         $forkRec = Get-SessionRec $s.id
-        if ($forkRec -and $errCreated) {
+        if (-not $SessionID -and $forkRec -and $errCreated) {
             try {
                 if ($forkRec.PSObject.Properties['createdAt'] -and $forkRec.createdAt) {
                     $forkMs = [DateTimeOffset]::Parse([string]$forkRec.createdAt).ToUnixTimeMilliseconds()
@@ -1981,7 +2066,7 @@ function Get-FailedSessions {
         if ($freshMinutes -gt 0 -and $errCreated) {
             $ageMin = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$errCreated) / 60000.0
             if ($ageMin -gt $freshMinutes) {
-                Log ("not resuming {0} ({1}): failure is {2:N0} min old (fresh limit {3} min)" -f $s.id, $s.title, $ageMin, $freshMinutes)
+                Log ("not resuming {0} ({1}): failure is {2:N0} min old (fresh limit {3} min; press R or use -ResumeStale to force)" -f $s.id, $s.title, $ageMin, $freshMinutes)
                 continue
             }
         }
@@ -1989,7 +2074,7 @@ function Get-FailedSessions {
         # skip only when this failure predates our last prompt for the session
         # (fresh failures pass). endpoint/connreset retries are allowed to hit
         # the same session repeatedly.
-        if (($kinds -contains 'rate') -or ($kinds -contains 'timeout')) {
+        if (-not $IncludePrompted -and (($kinds -contains 'rate') -or ($kinds -contains 'timeout'))) {
             $props = $Script:State.prompted.PSObject.Properties[$s.id]
             if ($props -and $errCreated) {
                 $fresh = $false
@@ -2159,17 +2244,89 @@ function Restart-OpencodeService {
 }
 
 function Send-ContinueToSession {
-    param([string]$sessionID)
+    param([string]$sessionID, [string]$Text)
+    if (-not $Text) { $Text = [string]$Script:Cfg.ContinueText }
     Push-Location $Script:Cfg.ProjectDir
     try {
         # PS5.1 loses embedded quotes when the npm shim spawns the native exe;
         # pre-escape quotes so the payload arrives as valid JSON.
-        $body = '{\"text\":\"' + $Script:Cfg.ContinueText + '\"}'
+        $body = '{\"text\":\"' + (([string]$Text) -replace '"', '\\\"') + '\"}'
         $out = & opencode api post ("/api/session/{0}/prompt" -f $sessionID) --data $body 2>&1
         $txt = (($out -join ' ') -replace '\s+', ' ')
         if ($txt.Length -gt 160) { $txt = $txt.Substring(0, 160) }
-        Log ("continue -> {0}: {1}" -f $sessionID, $txt)
+        Log ("continue ({0}) -> {1}: {2}" -f $Text, $sessionID, $txt)
         return ($LASTEXITCODE -eq 0)
+    } finally { Pop-Location }
+}
+
+# ------------------------------------------------------------ '.' rate canary
+# After a server switch the provider may still be throttling (account-wide) or
+# may have settled (per-session flag only). A brand-new session carries no
+# transcript and no session-bound quota flag, so one '.' prompt there is the
+# cleanest probe: its first response shows whether the limit is still live.
+# A 'hit' verdict hands the failover a reason to auto-ban that server and
+# switch to the next one; only a canary that comes out ok unlocks the
+# fork/continue phase (see the gate loop in Invoke-Failover).
+function Test-RateCanary {
+    param([string]$context = 'failover')
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        $new = (& opencode api post /api/session --data '{}' 2>&1) -join "`n"
+        $sess = $null
+        try { $sess = $new | ConvertFrom-Json } catch { }
+        $sid = $null
+        if ($sess -and $sess.data -and $sess.data.id) { $sid = $sess.data.id }
+        elseif ($sess -and $sess.id) { $sid = $sess.id }
+        if (-not $sid) {
+            Log ("rate canary ({0}): could not create the probe session - no verdict" -f $context)
+            return $null
+        }
+        # The probe session must never be scanned, resumed, or burned by the
+        # watchdog itself - record it as ignored (reason rate-canary) in state.
+        if (-not $Script:State) { Load-State }
+        $canaryRec = New-Object PSObject
+        Add-Member -InputObject $canaryRec -NotePropertyName ignored -NotePropertyValue $true -Force
+        Add-Member -InputObject $canaryRec -NotePropertyName ignoredAt -NotePropertyValue ((Get-Date).ToString('o')) -Force
+        Add-Member -InputObject $canaryRec -NotePropertyName ignoreReason -NotePropertyValue 'rate-canary' -Force
+        Add-Member -InputObject $canaryRec -NotePropertyName ignoreKind -NotePropertyValue 'manual' -Force
+        Add-Member -InputObject $Script:State.sessions -NotePropertyName $sid -NotePropertyValue $canaryRec -Force
+        Save-State
+        Set-SessionTitle $sid 'rate-canary' | Out-Null
+        Log ("rate canary ({0}): probe session {1} - sending '{2}'..." -f $context, $sid, $Script:Cfg.RateCanaryText)
+        Send-ContinueToSession -sessionID $sid -Text ([string]$Script:Cfg.RateCanaryText) | Out-Null
+        $deadline = [DateTime]::UtcNow.AddSeconds([double]$Script:Cfg.RateCanaryWaitSec)
+        $errText = $null
+        $clean = $false
+        while ([DateTime]::UtcNow -lt $deadline) {
+            Start-Sleep -Seconds 2
+            $msgs = Invoke-OC ("/api/session/{0}/message?order=desc&limit=8" -f $sid)
+            if (-not $msgs -or -not $msgs.data) { continue }
+            foreach ($m in $msgs.data) {
+                if ($m.type -ne 'assistant' -and $m.type -ne 'idle') { continue }
+                if ($m.error -and $m.error.message) {
+                    $errText = [string]$m.error.message
+                    break
+                }
+                if ($m.type -eq 'assistant') { $clean = $true }
+                break
+            }
+            if ($errText -or $clean) { break }
+        }
+        if ($errText) {
+            if ($errText.Length -gt 140) { $errText = $errText.Substring(0, 140) }
+            if ($errText -match $Script:Cfg.RateLimitPattern) {
+                Log ("rate canary ({0}): HIT - probe session {1} hit the rate limit ({2}); the limit is live account-wide, not session-bound" -f $context, $sid, $errText)
+            } else {
+                Log ("rate canary ({0}): FAILED - probe session {1} errored ({2}); retry may need another switch" -f $context, $sid, $errText)
+            }
+            return @{ verdict = $(if ($errText -match $Script:Cfg.RateLimitPattern) { 'hit' } else { 'other-error' }); id = $sid; msg = $errText }
+        }
+        if ($clean) {
+            Log ("rate canary ({0}): CLEAN - probe session {1} got a normal response (limit settled or session-bound)" -f $context, $sid)
+            return @{ verdict = 'clean'; id = $sid; msg = '' }
+        }
+        Log ("rate canary ({0}): no verdict - probe session {1} produced no response within {2}s" -f $context, $sid, $Script:Cfg.RateCanaryWaitSec)
+        return @{ verdict = 'timeout'; id = $sid; msg = '' }
     } finally { Pop-Location }
 }
 
@@ -2194,6 +2351,20 @@ function Test-SessionBurned([string]$sessionID) {
     $rec = Get-SessionRec $sessionID
     if (-not $rec) { return $false }
     try { return [bool]$rec.forkID } catch { return $false }
+}
+
+function Test-SessionIgnored([string]$sessionID) {
+    $rec = Get-SessionRec $sessionID
+    if (-not $rec) { return $false }
+    try { return [bool]$rec.ignored } catch { return $false }
+}
+
+function Test-SessionSuppressed([string]$sessionID) {
+    $rec = Get-SessionRec $sessionID
+    if (-not $rec) { return $false }
+    try { if ([bool]$rec.forkID) { return $true } } catch { }
+    try { if ([bool]$rec.ignored) { return $true } } catch { }
+    return $false
 }
 
 function Test-SessionExists([string]$sessionID) {
@@ -2250,7 +2421,8 @@ function New-SessionFork {
         [string]$sessionID,
         [string]$reason = 'failover',
         [string]$kind = '',
-        [string]$title = ''
+        [string]$title = '',
+        [switch]$IgnoreCap
     )
     if (-not $sessionID) { return $null }
     if (-not $Script:Cfg.SessionForkEnabled) { return $null }
@@ -2263,8 +2435,8 @@ function New-SessionFork {
         try { if ($rec.depth) { $depth = [int]$rec.depth + 1 } } catch { }
         try { if ($rec.rootID) { $rootID = [string]$rec.rootID } } catch { }
     }
-    if ($depth -gt [int]$Script:Cfg.SessionForkMaxDepth) {
-        Log ("session {0} reached the fork depth limit ({1}) - not forking again" -f $sessionID, $Script:Cfg.SessionForkMaxDepth)
+    if ((-not $IgnoreCap) -and ($depth -gt [int]$Script:Cfg.SessionForkMaxDepth)) {
+        Log ("session {0} reached the fork depth limit ({1}) - not forking again (use the session menu's fork option or -ForkSession to override the cap)" -f $sessionID, $Script:Cfg.SessionForkMaxDepth)
         return $null
     }
     if ((Get-ForkCountSince (Get-Date).AddHours(-1)) -ge [int]$Script:Cfg.SessionForkMaxPerHour) {
@@ -2325,7 +2497,8 @@ function Resume-FailedSession {
         [pscustomobject]$Session,
         [string]$Reason = 'failover',
         [switch]$NoFork,
-        [switch]$AllowRepeat
+        [switch]$AllowRepeat,
+        [switch]$ForceFork
     )
     if (-not $Session -or -not $Session.id) { return $false }
     $id = [string]$Session.id
@@ -2334,7 +2507,9 @@ function Resume-FailedSession {
 
     # A burned session is never prompted again. If it already has a fork, that
     # fork is the live continuation; if the fork was deleted, make a new one.
-    if ($rec -and $rec.forkID) {
+    # -ForceFork skips both: it always forks a fresh chain from the session,
+    # ignoring the recorded fork and the depth cap (manual recovery only).
+    if ($rec -and $rec.forkID -and -not $ForceFork) {
         $target = [string]$rec.forkID
         if (-not (Test-SessionExists $target)) {
             Log ("recorded fork {0} for burned session {1} no longer exists - forking again" -f $target, $id)
@@ -2344,7 +2519,12 @@ function Resume-FailedSession {
     }
 
     if ($target -eq $id -and -not $NoFork -and $Script:Cfg.SessionForkEnabled) {
-        $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title)
+        $forkID = $null
+        if ($ForceFork) {
+            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title) -IgnoreCap
+        } else {
+            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title)
+        }
         if (-not $forkID) {
             Log ("not continuing {0}: session fork failed and the flagged session was not reused" -f $id)
             return $false
@@ -2386,6 +2566,266 @@ function Resume-FailedSession {
     return $false
 }
 
+# ------------------------------------------------------ failed-session menu
+function Add-IgnoredSession {
+    param(
+        [object]$Session,
+        [string]$Reason = 'manual'
+    )
+    if (-not $Session -or -not $Session.id) { return $false }
+    $id = [string]$Session.id
+    if (Test-SessionBurned $id) {
+        Log ("session {0} is already burned; not ignoring" -f $id)
+        return $false
+    }
+    if (Test-SessionIgnored $id) {
+        Log ("session {0} is already ignored" -f $id)
+        return $false
+    }
+    $title = ''
+    try { $title = [string]$Session.title } catch { }
+    $kind = ''
+    try { $kind = [string]$Session.kind } catch { }
+    # Preserve any existing prompt/fork metadata on this session; add the ignore
+    # flags instead of replacing the record.
+    $rec = Get-SessionRec $id
+    if (-not $rec) {
+        $rec = New-Object PSObject
+        Add-Member -InputObject $Script:State.sessions -NotePropertyName $id -NotePropertyValue $rec -Force
+    }
+    Add-Member -InputObject $rec -NotePropertyName ignored -NotePropertyValue $true -Force
+    Add-Member -InputObject $rec -NotePropertyName ignoredAt -NotePropertyValue (Get-Date).ToString('o') -Force
+    Add-Member -InputObject $rec -NotePropertyName ignoreReason -NotePropertyValue $Reason -Force
+    Add-Member -InputObject $rec -NotePropertyName ignoreTitle -NotePropertyValue $title -Force
+    Add-Member -InputObject $rec -NotePropertyName ignoreKind -NotePropertyValue $kind -Force
+    Save-State
+    Log ("session {0} ignored forever ({1})" -f $id, $title)
+    return $true
+}
+
+function Remove-IgnoredSession([string]$sessionID) {
+    if (-not $sessionID) { return $false }
+    if (-not $Script:State) { Load-State }
+    $p = $Script:State.sessions.PSObject.Properties[$sessionID]
+    if (-not $p) {
+        Log ("no ignore record for " + $sessionID)
+        return $false
+    }
+    $rec = $p.Value
+    $ignored = $false
+    try { $ignored = [bool]$rec.ignored } catch { }
+    if (-not $ignored) {
+        Log ("session {0} is not ignored" -f $sessionID)
+        return $false
+    }
+    $fork = ''
+    try { $fork = [string]$rec.forkID } catch { }
+    foreach ($name in @('ignored', 'ignoredAt', 'ignoreReason', 'ignoreTitle', 'ignoreKind')) {
+        try { $rec.PSObject.Properties.Remove($name) } catch { }
+    }
+    # Drop the record only if it held nothing else (no prompt/fork metadata).
+    if (@($rec.PSObject.Properties).Count -eq 0) {
+        $Script:State.sessions.PSObject.Properties.Remove($sessionID) | Out-Null
+    }
+    Save-State
+    if ($fork) {
+        Log ("ignore cleared for session {0}; it remains burned (fork {1})" -f $sessionID, $fork)
+    } else {
+        Log ("session {0} unignored - it can be scanned and prompted again" -f $sessionID)
+    }
+    return $true
+}
+
+function Format-SessionAge([object]$errCreated) {
+    $ms = 0
+    try { $ms = [int64]$errCreated } catch { return '?' }
+    if ($ms -le 0) { return '?' }
+    $mins = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - $ms) / 60000.0
+    if ($mins -lt 0) { $mins = 0 }
+    if ($mins -lt 60) { return ('{0:N0}m' -f $mins) }
+    if ($mins -lt 1440) { return ('{0:N1}h' -f ($mins / 60.0)) }
+    return ('{0:N1}d' -f ($mins / 1440.0))
+}
+
+function Get-SessionMenuTitle([object]$Session) {
+    $title = ''
+    try { $title = [string]$Session.title } catch { }
+    if (-not $title) { $title = '(untitled)' }
+    $title = ($title -replace '\s+', ' ').Trim()
+    if ($title.Length -gt 76) { $title = $title.Substring(0, 73) + '...' }
+    return $title
+}
+
+function Show-FailedSessionAction {
+    param([object]$Session)
+    while ($true) {
+        try { Clear-Host } catch { }
+        $title = Get-SessionMenuTitle $Session
+        $kind = ''
+        try { $kind = [string]$Session.kind } catch { }
+        if ($Session.quota) { $kind = 'quota' }
+        $msg = ''
+        try { $msg = (([string]$Session.msg) -replace '\s+', ' ').Trim() } catch { }
+        if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 297) + '...' }
+        Write-Host ''
+        Write-Host 'Failed session'
+        Write-Host '------------------------------------------------------------'
+        Write-Host ('Title : {0}' -f $title)
+        Write-Host ('ID    : {0}' -f $Session.id)
+        Write-Host ('Kind  : {0}    Age: {1}' -f $kind, (Format-SessionAge $Session.errCreated))
+        Write-Host ('Error : {0}' -f $msg)
+        Write-Host ''
+        Write-Host '[C] continue (fork + prompt)    [F] fork fresh (ignore cap)    [I] ignore forever'
+        Write-Host '[B] back    [Q] quit'
+        $a = Read-Host 'Action'
+        if ($null -eq $a) { return 'quit' }
+        $a = ([string]$a).Trim()
+        switch -Regex ($a) {
+            '^[Cc]$' {
+                Write-Host ''
+                Write-Host 'Continuing in a fork...'
+                $ok = Resume-FailedSession -Session $Session -Reason 'session-menu' -AllowRepeat
+                if ($ok) {
+                    $fork = ''
+                    $rec = Get-SessionRec ([string]$Session.id)
+                    if ($rec) { try { $fork = [string]$rec.forkID } catch { } }
+                    Write-Host ('Continued. New fork: {0}' -f $fork)
+                } else {
+                    Write-Host 'Continue failed - see failover.log for the reason.'
+                }
+                Read-Host 'Press Enter to return' | Out-Null
+                return 'back'
+            }
+            '^[Ff]$' {
+                Write-Host ''
+                Write-Host 'Forking a fresh chain (depth cap ignored)...'
+                $ok = Resume-FailedSession -Session $Session -Reason 'session-menu-force' -ForceFork -AllowRepeat
+                if ($ok) {
+                    $fork = ''
+                    $rec = Get-SessionRec ([string]$Session.id)
+                    if ($rec) { try { $fork = [string]$rec.forkID } catch { } }
+                    Write-Host ('Forked. New fork: {0}' -f $fork)
+                } else {
+                    Write-Host 'Fork failed - see failover.log for the reason.'
+                }
+                Read-Host 'Press Enter to return' | Out-Null
+                return 'back'
+            }
+            '^[Ii]$' {
+                $confirm = Read-Host ('Ignore "{0}" forever? [y/N]' -f $title)
+                if (([string]$confirm).Trim() -match '^(y|yes)$') {
+                    Write-Host ''
+                    Write-Host 'Ignoring forever...'
+                    if (Add-IgnoredSession -Session $Session -Reason 'session-menu') {
+                        Write-Host 'Ignored. It will not be auto-resumed or listed again.'
+                    } else {
+                        Write-Host 'Ignore failed - see failover.log for the reason.'
+                    }
+                    Read-Host 'Press Enter to return' | Out-Null
+                    return 'back'
+                }
+                continue
+            }
+            '^[Bb]$' { return 'back' }
+            '^[Qq]$' { return 'quit' }
+            default {
+                Write-Host 'Invalid action.'
+                Start-Sleep -Milliseconds 600
+            }
+        }
+    }
+}
+
+function Start-FailedSessionMenu {
+    param([switch]$FromDashboard)
+    $oldSuppress = $Script:SuppressRender
+    if ($FromDashboard) { $Script:SuppressRender = $true }
+    try {
+        try { Clear-Host } catch { }
+        $info = Invoke-OC '/api/info'
+        if ($null -eq $info) {
+            Write-Host 'OpenCode API is not reachable. Start OpenCode and try again.'
+            Read-Host 'Press Enter to return' | Out-Null
+            return
+        }
+        $page = 0
+        $pageSize = 12
+        while ($true) {
+            try { Clear-Host } catch { }
+            Write-Host ''
+            Write-Host 'Failed sessions (all ages)'
+            Write-Host '------------------------------------------------------------'
+            Write-Host 'Scanning...'
+            $failed = @(Get-FailedSessions -AllAges -freshMinutes 0 -IncludePrompted | Sort-Object @{Expression={ [int64]$_.errCreated }; Descending=$true})
+            if (-not $failed.Count) {
+                try { Clear-Host } catch { }
+                Write-Host ''
+                Write-Host 'No failed sessions found.'
+                $ignoredCount = @($Script:State.sessions.PSObject.Properties | Where-Object {
+                    $_.Value -and $_.Value.PSObject.Properties['ignored'] -and $_.Value.ignored
+                }).Count
+                if ($ignoredCount -gt 0) {
+                    Write-Host ('Ignored forever: {0} (use -ListIgnored / -UnignoreSession)' -f $ignoredCount)
+                }
+                Read-Host 'Press Enter to return' | Out-Null
+                return
+            }
+            $pages = [Math]::Max(1, [int][Math]::Ceiling($failed.Count / [double]$pageSize))
+            if ($page -ge $pages) { $page = $pages - 1 }
+            if ($page -lt 0) { $page = 0 }
+            try { Clear-Host } catch { }
+            Write-Host ''
+            Write-Host 'Failed sessions (all ages)'
+            Write-Host '------------------------------------------------------------'
+            Write-Host ('Page {0}/{1}    {2} failed session(s)' -f ($page + 1), $pages, $failed.Count)
+            $start = $page * $pageSize
+            $end = [Math]::Min($start + $pageSize - 1, $failed.Count - 1)
+            for ($i = $start; $i -le $end; $i++) {
+                $s = $failed[$i]
+                $kind = ''
+                try { $kind = [string]$s.kind } catch { }
+                if ($s.quota) { $kind = 'quota' }
+                Write-Host ('  [{0}] {1,-7} {2,6}  {3}' -f ($i + 1), $kind, (Format-SessionAge $s.errCreated), (Get-SessionMenuTitle $s))
+            }
+            $ignoredCount = @($Script:State.sessions.PSObject.Properties | Where-Object {
+                $_.Value -and $_.Value.PSObject.Properties['ignored'] -and $_.Value.ignored
+            }).Count
+            Write-Host ''
+            if ($ignoredCount -gt 0) {
+                Write-Host ('Ignored forever: {0} (use -ListIgnored / -UnignoreSession)' -f $ignoredCount)
+            }
+            Write-Host '[number] select    [N] next    [P] previous    [R] refresh    [Q] quit'
+            $choice = Read-Host 'Choice'
+            if ($null -eq $choice) { return }
+            $choice = ([string]$choice).Trim()
+            if ($choice -match '^[Qq]$') { return }
+            if ($choice -match '^[Rr]$') { continue }
+            if ($choice -match '^[Nn]$') {
+                if ($page -lt $pages - 1) { $page++ }
+                continue
+            }
+            if ($choice -match '^[Pp]$') {
+                if ($page -gt 0) { $page-- }
+                continue
+            }
+            $num = 0
+            if ([int]::TryParse($choice, [ref]$num) -and $num -ge 1 -and $num -le $failed.Count) {
+                $action = Show-FailedSessionAction -Session $failed[$num - 1]
+                if ($action -eq 'quit') { return }
+                $page = 0
+                continue
+            }
+            Write-Host 'Invalid choice.'
+            Start-Sleep -Milliseconds 700
+        }
+    } finally {
+        if ($FromDashboard) {
+            $Script:SuppressRender = $oldSuppress
+            $Script:LayoutReady = $false
+        }
+    }
+}
+
 # ------------------------------------------------------------------- failover
 function Mark-Used([pscustomobject]$srv) {
     if (-not $srv -or -not $srv.host) { return }
@@ -2410,48 +2850,16 @@ function Get-SwitchCooldownSec {
     return $normal
 }
 
-function Invoke-Failover {
-    param([string]$Reason = 'auto', [switch]$Fast)
-    Load-State
-    $global:LastFailover = Get-Date
-    # A failover that aborts before its prompt phase must not leave the previous
-    # phase's window in place for instant-timeout classification.
-    $global:FailoverPromptStart = $null
-    $global:FailoverPromptEnd = $null
-    $cur = Get-ActiveServer
-    if ($cur) {
-        if ($Reason -eq 'quota') {
-            Add-AutoBannedServer (Get-ServerKey $cur) 'free usage limit' | Out-Null
-        } elseif ($Reason -eq 'timeout-instant') {
-            Add-AutoBannedServer (Get-ServerKey $cur) 'instant timeout after continue' | Out-Null
-        }
-        Invoke-FailoverReason-Log $Reason $cur
-        Mark-Used $cur
-    } else {
-        Log ('cannot read current Happ server - proceeding with failover (' + $Reason + ')')
-    }
-    if ($Fast) {
-        # The pre-switch API scan can take seconds per session and is repeated
-        # by the post-reload pass anyway.
-        $affected = @()
-        Log 'fast failover: deferring affected-session scan until after the switch'
-    } else {
-        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
-        $affectedIds = (($affected | ForEach-Object { $_.id }) -join ', ')
-        if (-not $affectedIds) { $affectedIds = 'none' }
-        Log ("affected sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $affectedIds)
-    }
-
-    # A live desktop app keeps HTTP/SSE connections pinned to the old core.
-    # Stop it before the server changes and start it again once the switch is done.
-    $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
-    if ($Script:Cfg.RestartOpenCode -and $desktopWasRunning) {
-        if (-not (Stop-OpencodeDesktop -Fast:$Fast)) {
-            Log 'opencode desktop could not be stopped - aborting the switch'
-            return
-        }
-    }
-
+function Switch-HappServer {
+    # Switch Happ to the next unused, unbanned cached server and bring opencode
+    # back up (service restart by default; in app-restart mode the caller stops
+    # the desktop first and passes -RestartDesktop so it is relaunched here).
+    # Returns a record @{ switched; rotated; appReady }.
+    param(
+        [pscustomobject]$Cur,
+        [switch]$Fast,
+        [bool]$RestartDesktop = $false
+    )
     $switched = $false
     $rotated = $false
     $appReady = $true
@@ -2462,7 +2870,7 @@ function Invoke-Failover {
     try {
         for ($attempt = 1; $attempt -le $Script:Cfg.MaxSwitchAttempts -and -not $switched; $attempt++) {
             $curKey = $null
-            if ($cur) { $curKey = Get-ServerKey $cur }
+            if ($Cur) { $curKey = Get-ServerKey $Cur }
             $cached = @(Get-CachedServerList)
             $cacheCount = $cached.Count
             $candidates = @()
@@ -2527,10 +2935,16 @@ function Invoke-Failover {
     } finally {
         if ($Script:Cfg.RestartOpenCode) {
             try {
-                if ($desktopWasRunning) {
-                    $appReady = Start-OpencodeDesktop
+                if ($Script:Cfg.RestartOpenCodeApp) {
+                    if ($RestartDesktop) {
+                        # full restart: the caller stopped the desktop for this round
+                        $appReady = Start-OpencodeDesktop
+                    } else {
+                        # no desktop process was stopped for this round (CLI-only usage)
+                        $appReady = Restart-OpencodeService
+                    }
                 } else {
-                    # no desktop process to relaunch (CLI-only usage) - keep the old behavior
+                    # default: keep the desktop app running, reload only the background service
                     $appReady = Restart-OpencodeService
                 }
             } catch {
@@ -2539,23 +2953,130 @@ function Invoke-Failover {
             }
         }
     }
-    if (-not $switched) { Log 'FAILED to switch to any previously unused server'; return }
-    if (-not $appReady) {
-        Log 'opencode did not come back - skipping continue prompts'
-        return
+    return [pscustomobject]@{ switched = $switched; rotated = $rotated; appReady = $appReady }
+}
+
+function Invoke-Failover {
+    param([string]$Reason = 'auto', [switch]$Fast)
+    Load-State
+    $global:LastFailover = Get-Date
+    # A new server generation starts with no endpoint soft-retry state.
+    $Script:Soft = New-SoftState
+    # A failover that aborts before its prompt phase must not leave the previous
+    # phase's window in place for instant-timeout classification.
+    $global:FailoverPromptStart = $null
+    $global:FailoverPromptEnd = $null
+    $cur = Get-ActiveServer
+    if ($cur) {
+        # The per-IP free usage limit ("Free usage limit reached. Subscribe to
+        # OpenCode Go...") belongs to the exit IP, not the server: a quota
+        # failover switches to a fresh IP but must never ban the server. Only a
+        # rate-limit error arriving immediately after one of our continue
+        # prompts (Reason 'rate-instant') counts as evidence against the server.
+        if ($Reason -eq 'rate-instant') {
+            Add-AutoBannedServer (Get-ServerKey $cur) 'rate limit right after continue' | Out-Null
+        } elseif ($Reason -eq 'timeout-instant') {
+            Add-AutoBannedServer (Get-ServerKey $cur) 'instant timeout after continue' | Out-Null
+        } elseif ($Reason -eq 'endpoint-instant') {
+            Add-AutoBannedServer (Get-ServerKey $cur) 'endpoint unavailable after continue' | Out-Null
+        }
+        Invoke-FailoverReason-Log $Reason $cur
+        Mark-Used $cur
+    } else {
+        Log ('cannot read current Happ server - proceeding with failover (' + $Reason + ')')
+    }
+    if ($Fast) {
+        # The pre-switch API scan can take seconds per session and is repeated
+        # by the post-reload pass anyway.
+        $affected = @()
+        Log 'fast failover: deferring affected-session scan until after the switch'
+    } else {
+        $affected = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+        $affectedIds = (($affected | ForEach-Object { $_.id }) -join ', ')
+        if (-not $affectedIds) { $affectedIds = 'none' }
+        Log ("affected sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $affectedIds)
     }
 
-    $settleSec = [int]$Script:Cfg.ContinueDelaySec
-    if ($Fast -and $settleSec -gt 1) { $settleSec = 1 }
-    if ($settleSec -gt 0) {
-        Log ("waiting {0}s for the provider to settle before continue prompts..." -f $settleSec)
-        Start-Sleep -Seconds $settleSec
-    }
+    # The canary gate: when rate-kind sessions are affected, a brand-new
+    # session must prove the freshly selected server clean before any fork is
+    # made. A canary that insta-hits the rate limit incriminates its server -
+    # auto-ban it and fail over to the next candidate. Forks and continue
+    # prompts only run on servers whose canary came out ok (or when no
+    # rate-kind work is affected). The post-reload scan decides the gate in
+    # Fast mode too, so it moved inside this loop.
+    $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
+    for ($round = 1; ; $round++) {
+        if ($round -gt 1) {
+            # canary retry: the previous round banned its server; re-read the
+            # active server and re-check the desktop bookkeeping.
+            $cur = Get-ActiveServer
+            $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
+        }
+        $stopDesktop = ($Script:Cfg.RestartOpenCode -and $Script:Cfg.RestartOpenCodeApp -and $desktopWasRunning)
+        if ($stopDesktop) {
+            if (-not (Stop-OpencodeDesktop -Fast:$Fast)) {
+                Log 'opencode desktop could not be stopped - aborting the switch'
+                return
+            }
+        }
+        $sw = Switch-HappServer -Cur $cur -Fast:$Fast -RestartDesktop:$stopDesktop
+        if (-not $sw.switched) {
+            if ($round -gt 1) {
+                Log 'canary retry could not switch to another server - skipping the fork/continue phase (affected sessions stay flagged for the next scan)'
+            } else {
+                Log 'FAILED to switch to any previously unused server'
+            }
+            return
+        }
+        if (-not $sw.appReady) {
+            Log 'opencode did not come back - skipping continue prompts'
+            return
+        }
 
-    $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
-    $postIds = (($postReload | ForEach-Object { $_.id }) -join ', ')
-    if (-not $postIds) { $postIds = 'none' }
-    Log ("post-reload failed sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $postIds)
+        $settleSec = [int]$Script:Cfg.ContinueDelaySec
+        if ($Fast -and $settleSec -gt 1) { $settleSec = 1 }
+        if ($settleSec -gt 0) {
+            Log ("waiting {0}s for the provider to settle before continue prompts..." -f $settleSec)
+            Start-Sleep -Seconds $settleSec
+        }
+
+        # Post-reload failed scan: feeds both the prompt phase and the gate.
+        $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+        $postIds = (($postReload | ForEach-Object { $_.id }) -join ', ')
+        if (-not $postIds) { $postIds = 'none' }
+        Log ("post-reload failed sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $postIds)
+
+        $gateSet = @(@($affected) + @($postReload))
+        if (-not (@($gateSet | Where-Object { [string]$_.kind -eq 'rate' }).Count)) {
+            Log 'no rate-kind failures on record - continuing without the canary gate'
+            break
+        }
+
+        $canary = Test-RateCanary -context ('failover ' + $Reason + (' round {0}' -f $round))
+        if ($canary -and ([string]$canary.verdict -eq 'hit')) {
+            # An instant rate limit in a brand-new session: the server or its
+            # exit IP is throttled right now - never fork onto it. Ban it and
+            # let the next canary round switch away to a clean server.
+            $curSrv = Get-ActiveServer
+            $badKey = $null
+            if ($curSrv) { $badKey = Get-ServerKey $curSrv }
+            if ($badKey) {
+                Add-AutoBannedServer $badKey 'canary rate limit right after switch' | Out-Null
+                Log ("canary HIT ({0} round {1}) - auto-banned server {2}; switching away to a clean server before any fork" -f $Reason, $round, $badKey)
+            } else {
+                Log ("canary HIT ({0} round {1}) - cannot read the active server to ban" -f $Reason, $round)
+            }
+            if ($round -ge [Math]::Max(1, [int]$Script:Cfg.RateCanaryMaxAttempts)) {
+                Log ("canary kept hitting the rate limit after {0} round(s) - skipping the fork/continue phase (affected sessions stay flagged for the next scan)" -f $round)
+                return
+            }
+            continue
+        }
+        # CLEAN, other-error, or no verdict: the server did not prove throttled.
+        $canaryVerdict = if ($canary) { [string]$canary.verdict } else { 'no-verdict' }
+        Log ("canary verdict '{0}' - server accepted; proceeding to forks and continues" -f $canaryVerdict)
+        break
+    }
     # Only continues sent during this failover's prompt phase are "connect ->
     # continue" evidence against the freshly selected server. A later revive or
     # endpoint-retry continue on a long-running server must not ban it.
@@ -2588,7 +3109,6 @@ function Test-OpLogTail {
     $lines = Get-Content $Script:Cfg.OpLogPath -Tail 300 -ErrorAction SilentlyContinue
     $rateNewest = $null
     $quotaNewest = $null
-    $endNewest = $null
     foreach ($l in $lines) {
         $ts = $null
         if ($l -match '^timestamp=([0-9T:\.\-]+)Z') {
@@ -2598,21 +3118,20 @@ function Test-OpLogTail {
         if ($l -match $Script:Cfg.RateLimitPattern) {
             if ($ts -gt $rateNewest) { $rateNewest = $ts }
             if ($l -match $Script:Cfg.QuotaBanPattern -and $ts -gt $quotaNewest) { $quotaNewest = $ts }
-        } elseif ($l -match $Script:Cfg.EndpointPattern) {
-            if ($ts -gt $endNewest) { $endNewest = $ts }
         }
     }
-    return @{ rate = $rateNewest; quota = $quotaNewest; endpoint = $endNewest }
+    return @{ rate = $rateNewest; quota = $quotaNewest }
 }
 
 # ------- session-level failure scan (API-based) ------------------------------
-# ECONNRESET and provider timeouts never reach opencode.log; the only persisted
-# record is the session message error. One pass counts connection-loss failures
-# inside the recent window and collects the newest timeout per top-level
-# session. Failures at or before state.connResetUntil / state.timeoutUntil were
-# already processed.
+# ECONNRESET, provider timeouts, and endpoint-unavailable errors never reach
+# opencode.log; the only persisted record is the session message error. One pass
+# counts connection-loss failures inside the recent window and collects the
+# newest timeout/endpoint failure per top-level session. Failures at or before
+# state.connResetUntil / state.timeoutUntil, or the in-memory EndpointSeenAt
+# watermark, were already processed.
 function Test-SessionFailureScan {
-    $result = [pscustomobject]@{ connReset = 0; timeouts = @() }
+    $result = [pscustomobject]@{ connReset = 0; timeouts = @(); endpoints = @() }
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { return $result }
     $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
@@ -2626,8 +3145,12 @@ function Test-SessionFailureScan {
     $updFloorMs = $nowMs - ([Math]::Max([int]$Script:Cfg.ConnResetWindowSec, 600) * 1000)
     $count = 0
     $timeouts = @{}
+    $endpoints = @{}
     foreach ($s in $root.data) {
         if ($Script:Cfg.TopLevelOnly -and $s.parentID) { continue }
+        # Burned and ignored sessions must not trigger endpoint/timeout failovers.
+        if (Test-SessionSuppressed $s.id) { continue }
+        if ([string]$s.title -match '^\[burned\]') { continue }
         $updMs = 0
         try { $updMs = [int64]$s.time.updated } catch { $updMs = 0 }
         if ($updMs -lt $updFloorMs) { continue }
@@ -2650,22 +3173,31 @@ function Test-SessionFailureScan {
                     if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
                     $timeouts[[string]$s.id] = [pscustomobject]@{ sessionID = [string]$s.id; created = [int64]$cMs; message = $msg }
                 }
+            } elseif ($m.error.message -match $Script:Cfg.EndpointPattern) {
+                $prev = $null
+                if ($endpoints.ContainsKey([string]$s.id)) { $prev = $endpoints[[string]$s.id] }
+                if (-not $prev -or $cMs -gt [int64]$prev.created) {
+                    $msg = [string]$m.error.message
+                    if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
+                    $endpoints[[string]$s.id] = [pscustomobject]@{ sessionID = [string]$s.id; created = [int64]$cMs; message = $msg }
+                }
             }
         }
     }
     $result.connReset = $count
     $result.timeouts = @($timeouts.Values | Sort-Object created)
+    $result.endpoints = @($endpoints.Values | Sort-Object created)
     return $result
 }
 
-# A timeout is "instant" when it arrives shortly after a continue prompt sent
-# during the latest failover: connect -> continue -> timeout. That points at the
-# freshly selected server, so it is worth banning. A timeout after the server
-# had been running for a while is ordinary provider behaviour: mark the server
-# used and switch, but keep the server for later rotation. The prompt must fall
-# inside the latest failover's prompt phase; a revive/endpoint retry continue on
-# a long-running server must never trigger a ban.
-function Test-TimeoutWasInstant([object]$failure) {
+# A failure is "instant" when it arrives shortly after a continue prompt sent
+# during the latest failover: connect -> continue -> endpoint/timeout. That points
+# at the freshly selected server, so it is worth banning. A failure after the
+# server had been running for a while is ordinary provider behaviour: mark the
+# server used and switch, but keep the server for later rotation. The prompt must
+# fall inside the latest failover's prompt phase; a revive/endpoint-retry continue
+# on a long-running server must never trigger a ban.
+function Test-FailureWasInstant([object]$failure) {
     if (-not $failure) { return $false }
     if (-not $global:FailoverPromptStart -or -not $global:FailoverPromptEnd) { return $false }
     $pr = $null
@@ -2681,6 +3213,37 @@ function Test-TimeoutWasInstant([object]$failure) {
     } catch { return $false }
     if ($promptMs -lt $startMs -or $promptMs -gt $endMs) { return $false }
     $ageSec = ([double]$failure.created - [double]$promptMs) / 1000.0
+    if ($ageSec -lt 0) { return $false }
+    return ($ageSec -le [int]$Script:Cfg.TimeoutInstantSec)
+}
+
+# opencode.log rate/quota lines carry no session id, so "instant" is judged
+# against the newest continue prompt on record: only a prompt sent during the
+# latest failover's prompt phase and followed by a rate-limit error within
+# TimeoutInstantSec counts as evidence against the freshly selected server
+# (connect -> continue -> rate limit). Any other rate error is ordinary
+# per-IP/provider throttling and must never ban the server.
+function Test-RateWasInstantFromLog([datetime]$rateAt) {
+    if (-not $rateAt) { return $false }
+    if (-not $global:FailoverPromptStart -or -not $global:FailoverPromptEnd) { return $false }
+    if (-not $Script:State) { Load-State }
+    $startMs = 0
+    $endMs = 0
+    try {
+        $startMs = ([DateTimeOffset]$global:FailoverPromptStart).ToUnixTimeMilliseconds()
+        $endMs = ([DateTimeOffset]$global:FailoverPromptEnd).ToUnixTimeMilliseconds()
+    } catch { return $false }
+    $newestMs = 0
+    try {
+        foreach ($p in @($Script:State.prompted.PSObject.Properties)) {
+            $ms = 0
+            try { $ms = [DateTimeOffset]::Parse([string]$p.Value).ToUnixTimeMilliseconds() } catch { continue }
+            if ($ms -gt $newestMs) { $newestMs = $ms }
+        }
+    } catch { return $false }
+    if (-not $newestMs -or $newestMs -lt $startMs -or $newestMs -gt $endMs) { return $false }
+    $rateMs = ([DateTimeOffset]$rateAt).ToUnixTimeMilliseconds()
+    $ageSec = ($rateMs - $newestMs) / 1000.0
     if ($ageSec -lt 0) { return $false }
     return ($ageSec -le [int]$Script:Cfg.TimeoutInstantSec)
 }
@@ -2712,9 +3275,14 @@ function New-SoftState {
         rounds = 0
         nextAt = [datetime]::MinValue
         lastSeen = [datetime]::MinValue
+        lastRetryAt = [datetime]::MinValue
     }
 }
 $Script:Soft = New-SoftState
+# Last endpoint error timestamp already handled. Kept separately from the soft
+# state so resetting a successful retry does not make the same old session error
+# look new again on the next scan.
+$Script:EndpointSeenAt = [datetime]::MinValue
 $Script:ConnResetLast = $null
 $Script:TunnelLast = $null
 $Script:DeadStreak = 0
@@ -2724,9 +3292,12 @@ $Script:SawTunAlive = $false
 function Invoke-FailoverReason-Log([string]$reason, [pscustomobject]$cur) {
     $label = Format-ServerLabel $cur
     switch ($reason) {
-        'auto' { Log ("rate limit detected; current server {0}" -f $label) }
-        'quota' { Log ("free usage limit reached; current server {0} auto-banned and marked used" -f $label) }
+        'auto' { Log ("rate limit detected; current server {0} marked used (not banned)" -f $label) }
+        'quota' { Log ("free usage limit reached; current server {0} marked used (not banned - the quota is per exit IP)" -f $label) }
+        'rate-instant' { Log ("rate limit right after our continue; current server {0} auto-banned and marked used" -f $label) }
         'timeout-instant' { Log ("timeout immediately after continue; current server {0} auto-banned and marked used" -f $label) }
+        'endpoint-instant' { Log ("endpoint unavailable immediately after continue; current server {0} auto-banned and marked used" -f $label) }
+        'endpoint-persist' { Log ("endpoint errors persisted after 2 continue retries; current server {0} marked used (not banned)" -f $label) }
         'timeout' { Log ("timeout after normal use; current server {0} marked used (not banned)" -f $label) }
         'manual' { Log ("manual switch requested; current server {0} marked used" -f $label) }
         'manual-ban' { Log ("manual ban requested; leaving current server {0} and marking it used" -f $label) }
@@ -2737,15 +3308,48 @@ function Invoke-FailoverReason-Log([string]$reason, [pscustomobject]$cur) {
 }
 
 function Handle-Endpoint {
+    param([switch]$ErrorSeen, [datetime]$ErrorAt = [datetime]::MinValue)
     $now = Get-Date
-    if (-not $Script:Soft.active) {
-        $Script:Soft.active = $true
-        $Script:Soft.rounds = 0
-        $Script:Soft.nextAt = $now.AddSeconds(60)
-        Log ('upstream endpoint-unavailable detected; same-server continue retry scheduled in ~60s')
+    if ($ErrorSeen) {
+        if (-not $Script:Soft.active) {
+            $Script:Soft.active = $true
+            $Script:Soft.rounds = 0
+            $Script:Soft.lastSeen = $ErrorAt
+            $Script:Soft.lastRetryAt = [datetime]::MinValue
+            $Script:Soft.nextAt = $now.AddSeconds(60)
+            Log 'upstream endpoint-unavailable detected; same-server continue retry scheduled in ~60s'
+            return
+        }
+        $Script:Soft.lastSeen = $ErrorAt
+        # An error that arrives after a continue retry proves that retry failed.
+        # Errors seen before the first scheduled retry only refresh the timestamp.
+        if ($Script:Soft.lastRetryAt -ne [datetime]::MinValue -and $ErrorAt -gt $Script:Soft.lastRetryAt) {
+            if ($Script:Soft.rounds -ge 2) {
+                Log ("endpoint errors persist after {0} same-server continue tries - fast switching server" -f $Script:Soft.rounds)
+                $Script:Soft = New-SoftState
+                Invoke-Failover -Reason 'endpoint-persist' -Fast
+            } else {
+                $Script:Soft.nextAt = $now.AddSeconds(60)
+                Log ("endpoint-unavailable persists after continue try #{0} - next same-server continue retry scheduled in ~60s" -f $Script:Soft.rounds)
+            }
+        }
         return
     }
+    # Timer tick: send the next same-server continue when it is due. If the last
+    # retry produced no new endpoint error, it worked; reset instead of switching.
+    if (-not $Script:Soft.active) { return }
     if ($now -lt $Script:Soft.nextAt) { return }
+    if ($Script:Soft.lastRetryAt -ne [datetime]::MinValue -and $Script:Soft.lastSeen -lt $Script:Soft.lastRetryAt) {
+        Log 'no new endpoint errors after the same-server continue - soft-retry state reset'
+        $Script:Soft = New-SoftState
+        return
+    }
+    if ($Script:Soft.rounds -ge 2) {
+        Log ("endpoint errors persist after {0} same-server continue tries - fast switching server" -f $Script:Soft.rounds)
+        $Script:Soft = New-SoftState
+        Invoke-Failover -Reason 'endpoint-persist' -Fast
+        return
+    }
     $Script:Soft.rounds++
     Log ("endpoint-unavailable persists - sending same-server continue (try #{0})" -f $Script:Soft.rounds)
     $sess = Get-FailedSessions -kinds @('endpoint') -windowMinutes 120
@@ -2758,18 +3362,12 @@ function Handle-Endpoint {
     } else {
         Log 'no sessions currently stuck on endpoint errors'
     }
-    if ($Script:Soft.rounds -ge 2) {
-        Log ("endpoint errors persist after {0} same-server continue tries - fast switching server" -f $Script:Soft.rounds)
-        $Script:Soft = New-SoftState
-        Invoke-Failover -Reason 'endpoint-persist' -Fast
-    } else {
-        $Script:Soft.nextAt = $now.AddSeconds(60)
-        Log 'next same-server continue retry scheduled in ~60s'
-    }
+    $Script:Soft.lastRetryAt = $now
+    $Script:Soft.nextAt = $now.AddSeconds(60)
 }
 
 # ------------------------------------------------------------------- test modes
-if ($ForkSession -or $UnburnSession -or $ListBurned) {
+if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $ListIgnored) {
     Load-State
     if ($ListBurned) {
         $burned = @($Script:State.sessions.PSObject.Properties | Where-Object {
@@ -2786,6 +3384,30 @@ if ($ForkSession -or $UnburnSession -or $ListBurned) {
             }
         }
     }
+    if ($ListIgnored) {
+        $ignored = @($Script:State.sessions.PSObject.Properties | Where-Object {
+            $_.Value -and $_.Value.PSObject.Properties['ignored'] -and $_.Value.ignored
+        })
+        if (-not $ignored.Count) {
+            Log 'ignored sessions: (none)'
+        } else {
+            foreach ($e in $ignored) {
+                $v = $e.Value
+                $title = ''
+                try { $title = [string]$v.ignoreTitle } catch { }
+                if (-not $title) { try { $title = [string]$v.title } catch { } }
+                $at = ''
+                try { $at = [string]$v.ignoredAt } catch { }
+                $why = ''
+                try { $why = [string]$v.ignoreReason } catch { }
+                if (-not $why) { try { $why = [string]$v.reason } catch { } }
+                $kind = ''
+                try { $kind = [string]$v.ignoreKind } catch { }
+                if (-not $kind) { try { $kind = [string]$v.kind } catch { } }
+                Log ("ignored session: {0} ({1}) [{4}] at {2}; {3}" -f $e.Name, $title, $at, $why, $kind)
+            }
+        }
+    }
     if ($UnburnSession) {
         $uKey = $UnburnSession.Trim()
         $up = $Script:State.sessions.PSObject.Properties[$uKey]
@@ -2794,10 +3416,24 @@ if ($ForkSession -or $UnburnSession -or $ListBurned) {
         } else {
             $uFork = ''
             try { $uFork = [string]$up.Value.forkID } catch { }
-            $Script:State.sessions.PSObject.Properties.Remove($uKey) | Out-Null
-            if ($uFork) { $Script:State.sessions.PSObject.Properties.Remove($uFork) | Out-Null }
-            Save-State
-            Log ("unburned session " + $uKey + " - it can be scanned and prompted again")
+            $uIgnored = $false
+            try { $uIgnored = [bool]$up.Value.ignored } catch { }
+            if ($uIgnored -and -not $uFork) {
+                Log ("session {0} is ignored, not burned - use -UnignoreSession" -f $uKey)
+            } else {
+                $Script:State.sessions.PSObject.Properties.Remove($uKey) | Out-Null
+                if ($uFork) { $Script:State.sessions.PSObject.Properties.Remove($uFork) | Out-Null }
+                Save-State
+                Log ("unburned session " + $uKey + " - it can be scanned and prompted again")
+            }
+        }
+    }
+    if ($UnignoreSession) {
+        $uKey = $UnignoreSession.Trim()
+        if (-not $uKey) {
+            Log 'no session id given for -UnignoreSession'
+        } else {
+            Remove-IgnoredSession $uKey | Out-Null
         }
     }
     if ($ForkSession) {
@@ -2808,8 +3444,57 @@ if ($ForkSession -or $UnburnSession -or $ListBurned) {
         } else {
             $fTitle = ''
             try { $fTitle = [string]$fResp.data.title } catch { }
-            $fNew = New-SessionFork -sessionID $fKey -reason 'manual' -kind 'manual' -title $fTitle
-            if ($fNew) { Log ("manual fork: {0} -> {1}" -f $fKey, $fNew) }
+            $fNew = New-SessionFork -sessionID $fKey -reason 'manual' -kind 'manual' -title $fTitle -IgnoreCap
+            if ($fNew) { Log ("manual fork (depth cap ignored): {0} -> {1}" -f $fKey, $fNew) }
+        }
+    }
+    return
+}
+if ($ResumeStale -or $ResumeSession) {
+    Load-State
+    $staleTargets = @()
+    if ($ResumeSession) {
+        $sid = $ResumeSession.Trim()
+        if (-not $sid) {
+            Log 'no session id given for -ResumeSession'
+            return
+        }
+        $staleTargets = @(Get-FailedSessions -SessionID $sid -windowMinutes 0 -freshMinutes 0 -IncludePrompted)
+        if (-not $staleTargets.Count) {
+            Log ("no current provider failure found for session " + $sid + " (not found, not top-level, healthy, or already moved on)")
+            return
+        }
+    } else {
+        # Explicit stale pass: ignore the automatic 15-min cutoff and the
+        # prompted-set dedup, but stay inside the normal affected window. Use
+        # -ResumeSession ses_id to target a specific older session.
+        $staleWindow = [int]$Script:Cfg.AffectedWindowMin
+        $staleTargets = @(Get-FailedSessions -windowMinutes $staleWindow -freshMinutes 0 -IncludePrompted)
+        $staleTargets = @($staleTargets | Where-Object {
+            $ageMin = 0.0
+            if ($_.errCreated) {
+                $ageMin = ([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$_.errCreated) / 60000.0
+            }
+            $ageMin -gt [double]$Script:Cfg.SessionResumeFreshMin
+        })
+        if (-not $staleTargets.Count) {
+            Log ("no failed sessions older than {0} min" -f $Script:Cfg.SessionResumeFreshMin)
+            return
+        }
+    }
+    foreach ($s in $staleTargets) {
+        $age = '?'
+        if ($s.errCreated) {
+            $age = [math]::Round(([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$s.errCreated) / 60000.0)
+        }
+        $title = [string]$s.title
+        if (-not $title) { $title = '(untitled)' }
+        Log ("manual stale resume: {0} ({1}) [{2}] failure {3} min old - forking and continuing" -f $s.id, $title, $s.kind, $age)
+        $resumed = Resume-FailedSession -Session $s -Reason 'manual-stale' -AllowRepeat
+        if ($resumed) {
+            Log ("manual stale resume sent for {0}" -f $s.id)
+        } else {
+            Log ("manual stale resume FAILED for {0}" -f $s.id)
         }
     }
     return
@@ -2897,7 +3582,7 @@ if ($TestSessions) {
         $r | ForEach-Object {
             $age = '?'
             if ($_.errCreated) { $age = [math]::Round(([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds() - [int64]$_.errCreated) / 60000.0) }
-            Log ("[rl] {0} (updated {1}, failure {2} min old) : {3}" -f $_.id, $_.when, $age, $_.msg)
+            Log ("[{0}] {1} (updated {2}, failure {3} min old) : {4}" -f $_.kind, $_.id, $_.when, $age, $_.msg)
         }
     }
     return
@@ -3037,6 +3722,12 @@ function Get-HeaderLines {
             $_.Value -and $_.Value.PSObject.Properties['forkID'] -and $_.Value.forkID
         }).Count
     } catch { }
+    $ignoredCount = 0
+    try {
+        $ignoredCount = @($Script:State.sessions.PSObject.Properties | Where-Object {
+            $_.Value -and $_.Value.PSObject.Properties['ignored'] -and $_.Value.ignored
+        }).Count
+    } catch { }
     $curKey = $null
     if ($cur) { $curKey = Get-ServerKey $cur }
     $freshCount = 0
@@ -3072,6 +3763,10 @@ function Get-HeaderLines {
     } catch {
         if ($freshCount -gt 0) { $nextLabel = 'random (' + $freshCount + ' eligible)' } else { $nextLabel = 'random rotation' }
     }
+    $endpointCount = 0
+    try {
+        $endpointCount = @($cached | ForEach-Object { '{0}:{1}' -f $_.host, $_.port } | Sort-Object -Unique).Count
+    } catch { }
     $curBanned = $false
     if ($curKey) { $curBanned = Test-ServerBanned $curKey }
     $guiProc = Get-Process Happ -ErrorAction SilentlyContinue | Select-Object -First 1
@@ -3106,8 +3801,10 @@ function Get-HeaderLines {
         ('Tunnel   : {0}' -f $tunnel),
         ('Capture  : {0}' -f $captureStatus),
         ('Exit IP  : {0}    (checked {1})' -f $exitIp, $exitWhen),
-        ('Next     : {0}    cache: {1}    used: {2}    banned: {3}    burned: {4}    last failover: {5}' -f $nextLabel, $cacheCount, $usedCount, $bannedCount, $burnedCount, $global:LastFailover),
-        ('[T] switch now    [B] ban current    [L] bans editor    [R] rescan+revive    [U] {0}    [C] clear used    [Q] quit' -f $uAction),
+        ('Next     : {0}    last failover: {1}' -f $nextLabel, $global:LastFailover),
+        ('Cache    : {0} files / {1} endpoints    used: {2}    banned: {3}    burned: {4}    ignored: {5}' -f $cacheCount, $endpointCount, $usedCount, $bannedCount, $burnedCount, $ignoredCount),
+        ('[T] switch now    [B] ban current    [L] bans editor    [S] failed sessions    [R] revive    [U] {0}' -f $uAction),
+        ('[C] clear used    [Q] quit'),
         ('----------------------------------------------------------------')
     )
 }
@@ -3237,6 +3934,8 @@ function Get-AllKnownServers {
         $used = $false
         try { $used = [bool]$Script:State.used.PSObject.Properties[$rec.key] } catch { }
         $current = ($rec.key -eq $curKey)
+        $sortBanKind = 2
+        if ($banned) { $sortBanKind = $(if ($banInfo.auto) { 0 } else { 1 }) }
         $endpointKey = ('{0}:{1}' -f $rec.host, $rec.port)
         $endpointPrimary = ''
         if ($aliasMap.ContainsKey($endpointKey)) {
@@ -3269,11 +3968,12 @@ function Get-AllKnownServers {
                 current    = $current
                 used       = $used
                 sortBanned = $(if ($banned) { 0 } else { 1 })
+                sortBanKind = $sortBanKind
                 sortName   = $(if ($nm) { $nm.ToLowerInvariant() } else { $rec.key.ToLowerInvariant() })
             })
         }
     }
-    return @($rows | Sort-Object sortBanned, sortName, key, uid)
+    return @($rows | Sort-Object sortBanned, sortBanKind, sortName, key, uid)
 }
 
 function Refresh-BansEditor {
@@ -3305,6 +4005,7 @@ function Refresh-BansEditor {
     elseif ($idx -ge $items.Count) { $idx = $items.Count - 1 }
     $Script:BansEditor.Items = $items
     $Script:BansEditor.Index = $idx
+    try { $Script:BansEditor.CacheCount = @(Get-CachedServerList).Count } catch { $Script:BansEditor.CacheCount = 0 }
     if ($Script:BansEditor.Offset -gt $idx) { $Script:BansEditor.Offset = $idx }
     if ($Script:BansEditor.Offset -lt 0) { $Script:BansEditor.Offset = 0 }
 }
@@ -3312,10 +4013,11 @@ function Refresh-BansEditor {
 function Open-BansEditor {
     Load-Bans
     $Script:BansEditor = [pscustomobject]@{
-        Active = $true
-        Items  = @()
-        Index  = 0
-        Offset = 0
+        Active     = $true
+        Items      = @()
+        Index      = 0
+        Offset     = 0
+        CacheCount = 0
     }
     Refresh-BansEditor
 }
@@ -3356,8 +4058,9 @@ function Reorder-BansEditor {
         $item.banSource = $(if ($bi) { [string]$bi.source } else { '' })
         $item.banWildcard = $(if ($bi) { [bool]$bi.wildcard } else { $false })
         $item.sortBanned = $(if ($item.banned) { 0 } else { 1 })
+        $item.sortBanKind = $(if ($item.banned) { $(if ($item.banAuto) { 0 } else { 1 }) } else { 2 })
     }
-    $items = @($old | Sort-Object sortBanned, sortName, key, uid)
+    $items = @($old | Sort-Object sortBanned, sortBanKind, sortName, key, uid)
     $newIdx = 0
     if ($selectedKey) {
         for ($i = 0; $i -lt $items.Count; $i++) {
@@ -3490,9 +4193,11 @@ function Render-BansEditor {
         }
         $bannedCount = $bannedKeys.Count
         $endpointCount = $endpointKeys.Count
+        $cacheCount = 0
+        try { $cacheCount = [int]$Script:BansEditor.CacheCount } catch { }
         $autoBannedCount = @($items | Where-Object { $_.banned -and $_.banAuto } | ForEach-Object { $_.key } | Sort-Object -Unique).Count
 
-        $hdrRows = 3
+        $hdrRows = 4
         $ftrRows = 1
         $view = [Math]::Max(1, $h - $hdrRows - $ftrRows)
         $offset = [int]$Script:BansEditor.Offset
@@ -3507,8 +4212,13 @@ function Render-BansEditor {
 
         $rows = New-Object System.Collections.Generic.List[object]
         $rows.Add([pscustomobject]@{
-            Text = ('BANS/SERVERS   {0} rows / {1} endpoints   banned {2} ({5} auto)   {3}-{4}   red=manual  orange=quota   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $count, $endpointCount, $bannedCount, $first, $last, $autoBannedCount)
+            Text = ('BANS/SERVERS   {0} rows ({1} cached files, {2} endpoints)   banned: {3} ({4} auto, first)' -f $count, $cacheCount, $endpointCount, $bannedCount, $autoBannedCount)
             Fg   = [ConsoleColor]::Cyan
+            Bg   = [ConsoleColor]::Black
+        })
+        $rows.Add([pscustomobject]@{
+            Text = ('showing {0}-{1} of {2}   Up/Down/PgUp/PgDn   Enter toggle   R rescan   Esc close' -f $first, $last, $count)
+            Fg   = [ConsoleColor]::DarkCyan
             Bg   = [ConsoleColor]::Black
         })
         $rows.Add([pscustomobject]@{
@@ -3555,7 +4265,14 @@ function Render-BansEditor {
             } else {
                 $fg = [ConsoleColor]::Gray; $bg = [ConsoleColor]::Black
             }
-            $rows.Add([pscustomobject]@{ Text = $text; Fg = $fg; Bg = $bg })
+            # Real orange for auto-bans when the terminal supports ANSI. The
+            # 16-color DarkYellow fallback is pale yellow in Windows Terminal.
+            $ansi = ''
+            if ($item.banned -and $item.banAuto -and $Script:AnsiColor) {
+                if ($selected) { $ansi = $Script:Esc + '[38;5;16m' + $Script:Esc + '[48;5;208m' }
+                else { $ansi = $Script:Esc + '[38;5;208m' + $Script:Esc + '[48;5;16m' }
+            }
+            $rows.Add([pscustomobject]@{ Text = $text; Fg = $fg; Bg = $bg; Ansi = $ansi })
         }
         if ($count -eq 0) {
             $rows.Add([pscustomobject]@{
@@ -3573,7 +4290,7 @@ function Render-BansEditor {
             $sel = $items[$idx]
             $label = $(if ($sel.name) { $sel.name } else { '(unnamed)' })
             $action = $(if ($sel.banned) { 'ENTER unban' } else { 'ENTER ban' })
-            $banNote = $(if ($sel.banned -and $sel.banAuto) { 'AUTO quota ban' } elseif ($sel.banned) { 'manual ban' } else { 'not banned' })
+            $banNote = $(if ($sel.banned -and $sel.banAuto) { 'AUTO ban (orange, listed first)' } elseif ($sel.banned) { 'manual ban' } else { 'not banned' })
             if ($sel.isProfile) {
                 $base = $(if ($sel.aliasOf) { $sel.aliasOf } else { '(endpoint)' })
                 $footer = ('Profile: {0}  ({1}) = same host:port as {2}; {3}; {4}   |   Up/Down move   Enter toggle   R rescan   Esc/L close' -f $label, $sel.key, $base, $banNote, $action)
@@ -3591,17 +4308,31 @@ function Render-BansEditor {
         for ($row = 0; $row -lt $h; $row++) {
             $r = $null
             if ($row -lt $rows.Count) { $r = $rows[$row] }
-            if ($r) { $txt = [string]$r.Text; $fg = $r.Fg; $bg = $r.Bg }
+            $ansi = ''
+            if ($r) {
+                $txt = [string]$r.Text; $fg = $r.Fg; $bg = $r.Bg
+                try { $ansi = [string]$r.Ansi } catch { $ansi = '' }
+            }
             else { $txt = ''; $fg = [ConsoleColor]::Gray; $bg = [ConsoleColor]::Black }
             if ($txt.Length -gt $w) { $txt = $txt.Substring(0, $w) } else { $txt = $txt.PadRight($w) }
             [Console]::SetCursorPosition(0, $row)
-            try {
-                # only touch the console colors when they actually change; this
-                # halves the API calls on long runs of same-colored rows
-                if ($fg -ne $lastFg) { [Console]::ForegroundColor = $fg; $lastFg = $fg }
-                if ($bg -ne $lastBg) { [Console]::BackgroundColor = $bg; $lastBg = $bg }
-            } catch { }
-            [Console]::Write($txt)
+            if ($ansi) {
+                # ANSI reset changes the real console colors, so invalidate the
+                # cached ConsoleColor values before the next row.
+                if ($lastFg -ne $null -or $lastBg -ne $null) {
+                    try { [Console]::ResetColor() } catch { }
+                    $lastFg = $null; $lastBg = $null
+                }
+                [Console]::Write($ansi + $txt + $Script:AnsiReset)
+            } else {
+                try {
+                    # only touch the console colors when they actually change; this
+                    # halves the API calls on long runs of same-colored rows
+                    if ($fg -ne $lastFg) { [Console]::ForegroundColor = $fg; $lastFg = $fg }
+                    if ($bg -ne $lastBg) { [Console]::BackgroundColor = $bg; $lastBg = $bg }
+                } catch { }
+                [Console]::Write($txt)
+            }
         }
         [Console]::ResetColor()
         [Console]::SetCursorPosition(0, [Math]::Max(0, $h - 1))
@@ -3667,6 +4398,12 @@ function Write-ConsoleEvent([string]$msg) {
         try { $Script:EventRing.RemoveAt(0) } catch { break }
     }
     if (-not $Script:SuppressRender) { Render-Frame }
+}
+
+if ($SessionMenu) {
+    Load-State
+    Start-FailedSessionMenu
+    return
 }
 
 if ($ListServers) {
@@ -3760,14 +4497,23 @@ if ($Watch) {
             # failover start, not a fixed 15s margin; otherwise a quota error
             # arriving seconds after a switch could be ignored forever.
             if ($fails.rate -and $fails.rate -gt $global:LastFailover) {
-                # A quota line is dominant even when a newer generic rate line
-                # follows it: the free window is exhausted, so the orange ban
-                # must not be skipped. Both timestamps are after LastFailover.
+                # A quota line (per-IP free usage window exhausted) still triggers
+                # a fast switch - a fresh exit IP is the remedy - but the server
+                # itself is never banned: the quota belongs to the exit IP, not
+                # to the server. Both timestamps are after LastFailover.
                 $quotaError = ($fails.quota -and $fails.rate -and $fails.quota -gt $global:LastFailover)
                 $switchCool = Get-SwitchCooldownSec
-                if ($quotaError -or $now -gt $global:LastFailover.AddSeconds($switchCool)) {
+                # Only a rate-limit error arriving right after one of our own
+                # continue prompts (latest failover's prompt phase) is evidence
+                # against the current server and bans it; that also fires inside
+                # the cooldown, like instant timeouts and endpoint errors.
+                $instantRate = Test-RateWasInstantFromLog $fails.rate
+                if ($instantRate) {
+                    Log 'rate limit right after our continue prompt - auto-banning current server and switching now'
+                    Invoke-Failover -Reason 'rate-instant' -Fast
+                } elseif ($quotaError -or $now -gt $global:LastFailover.AddSeconds($switchCool)) {
                     if ($quotaError) {
-                        Log 'free usage limit detected in opencode log - auto-banning current server and switching now'
+                        Log 'free usage limit detected in opencode log - switching server (no ban: the quota is per exit IP)'
                         Invoke-Failover -Reason 'quota' -Fast
                     } else {
                         Log 'rate limit detected in opencode log - fast failover starting'
@@ -3775,21 +4521,19 @@ if ($Watch) {
                     }
                 }
             }
-            # endpoint-unavailable: soft path (continue retries on the same server first)
+            # endpoint-unavailable is handled from the session API below: an
+            # immediate post-continue failure auto-bans, otherwise the soft path
+            # retries the same server first.
             if ($Script:Soft.active -and $Script:Soft.lastSeen -and ((Get-Date) - $Script:Soft.lastSeen).TotalMinutes -gt 15) {
                 Log 'no new endpoint errors for 15+ minutes - soft-retry state reset'
                 $Script:Soft = New-SoftState
             }
-            if ($fails.endpoint -and ($fails.endpoint -gt $Script:Soft.lastSeen)) {
-                $Script:Soft.lastSeen = $fails.endpoint
-                Handle-Endpoint
-            }
-            # connection-loss bursts and provider timeouts (neither reaches
-            # opencode.log - scan the session API on its own slower cadence)
+            # connection-loss bursts, provider timeouts, and endpoint failures (none
+            # reach opencode.log reliably - scan the session API on its own cadence)
             if ($null -eq $Script:ConnResetLast -or ((Get-Date) - $Script:ConnResetLast).TotalSeconds -ge $Script:Cfg.ConnResetScanSec) {
                 $Script:ConnResetLast = Get-Date
                 $scan = Test-SessionFailureScan
-                # Only timeouts newer than the current server generation can be
+                # Only failures newer than the current server generation can be
                 # evidence against it. The switch timestamp also excludes errors
                 # from the previous server while it was shutting down. A later
                 # failover attempt that never switched advances LastFailover and
@@ -3802,15 +4546,29 @@ if ($Watch) {
                 $newestTimeout = $null
                 foreach ($to in $newTimeouts) {
                     if (-not $newestTimeout -or [int64]$to.created -gt [int64]$newestTimeout.created) { $newestTimeout = $to }
-                    if (-not $instantTimeout -and (Test-TimeoutWasInstant $to)) { $instantTimeout = $to }
+                    if (-not $instantTimeout -and (Test-FailureWasInstant $to)) { $instantTimeout = $to }
                 }
-                $timeoutHandled = $false
+                $seenMs = 0
+                try { $seenMs = ([DateTimeOffset]$Script:EndpointSeenAt).ToUnixTimeMilliseconds() } catch { $seenMs = 0 }
+                $newEndpoints = @($scan.endpoints | Where-Object { $_ -and [int64]$_.created -gt $epochMs -and [int64]$_.created -gt $seenMs })
+                $instantEndpoint = $null
+                $newestEndpoint = $null
+                foreach ($ep in $newEndpoints) {
+                    if (-not $newestEndpoint -or [int64]$ep.created -gt [int64]$newestEndpoint.created) { $newestEndpoint = $ep }
+                    if (-not $instantEndpoint -and (Test-FailureWasInstant $ep)) { $instantEndpoint = $ep }
+                }
+                $newestEpAt = $null
+                if ($newestEndpoint) {
+                    $newestEpAt = [DateTimeOffset]::FromUnixTimeMilliseconds([int64]$newestEndpoint.created).LocalDateTime
+                    $Script:EndpointSeenAt = $newestEpAt
+                }
+                $failoverStarted = $false
                 if ($instantTimeout) {
                     Log ("timeout immediately after continue in {0} - auto-banning current server and fast switching" -f $instantTimeout.sessionID)
                     $until = [int64]$newestTimeout.created
                     Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
                     Save-State
-                    $timeoutHandled = $true
+                    $failoverStarted = $true
                     Invoke-Failover -Reason 'timeout-instant' -Fast
                 } elseif ($newestTimeout) {
                     if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
@@ -3818,14 +4576,31 @@ if ($Watch) {
                         $until = [int64]$newestTimeout.created
                         Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
                         Save-State
-                        $timeoutHandled = $true
+                        $failoverStarted = $true
                         Invoke-Failover -Reason 'timeout' -Fast
                     } else {
                         Log 'timeout detected but failover cooldown is active - waiting'
                     }
                 }
+                if (-not $failoverStarted -and $instantEndpoint) {
+                    Log ("endpoint unavailable immediately after continue in {0} - auto-banning current server and fast switching" -f $instantEndpoint.sessionID)
+                    $Script:Soft = New-SoftState
+                    $failoverStarted = $true
+                    Invoke-Failover -Reason 'endpoint-instant' -Fast
+                } elseif (-not $failoverStarted -and $newestEndpoint) {
+                    $lfBefore = $global:LastFailover
+                    Handle-Endpoint -ErrorSeen -ErrorAt $newestEpAt
+                    if ($global:LastFailover -ne $lfBefore) { $failoverStarted = $true }
+                }
+                # Timer tick: the soft path must send its 60s same-server continue
+                # even when no new endpoint error has arrived since the last scan.
+                if (-not $failoverStarted) {
+                    $lfBefore = $global:LastFailover
+                    Handle-Endpoint
+                    if ($global:LastFailover -ne $lfBefore) { $failoverStarted = $true }
+                }
                 $crCount = [int]$scan.connReset
-                if (-not $timeoutHandled -and $crCount -ge $Script:Cfg.ConnResetMinCount) {
+                if (-not $failoverStarted -and $crCount -ge $Script:Cfg.ConnResetMinCount) {
                     if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
                         Log ("{0} connection-loss failures within {1}s - fast switching server" -f $crCount, $Script:Cfg.ConnResetWindowSec)
                         Add-Member -InputObject $Script:State -NotePropertyName connResetUntil -NotePropertyValue ([string][DateTimeOffset]::Now.ToUnixTimeMilliseconds()) -Force
@@ -3927,6 +4702,9 @@ if ($Watch) {
                             'L' {
                                 Start-BansEditor
                             }
+                            'S' {
+                                Start-FailedSessionMenu -FromDashboard
+                            }
                             'R' {
                                 Log 'config cache rescan requested [R]'
                                 Update-ConfigCache | Out-Null
@@ -3976,4 +4754,4 @@ if ($Watch) {
     }
 }
 
-Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -CaptureAll [-CaptureSeconds N] / -ListServers / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ListBurned / -UnburnSession ses_id"
+Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -CaptureAll [-CaptureSeconds N] / -ListServers / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ResumeSession ses_id / -ResumeStale / -SessionMenu / -ListBurned / -UnburnSession ses_id / -ListIgnored / -UnignoreSession ses_id"
