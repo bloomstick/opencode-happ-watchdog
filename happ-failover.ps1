@@ -26,11 +26,15 @@
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnbanServer host:port
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBanned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ForkSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -OpenSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ResumeSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ResumeStale
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -SessionMenu
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListBurned
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnburnSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -CleanupBurnedSession ses_id
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -CloseStaleTabs
+    powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ResetForkCount ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -ListIgnored
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -UnignoreSession ses_id
     powershell -ExecutionPolicy Bypass -File happ-failover.ps1 -CaptureAll [-CaptureSeconds 120]
@@ -49,11 +53,16 @@ param(
     [string]$UnbanServer,
     [switch]$ListBanned,
     [string]$ForkSession,
+    [string]$OpenSession,
     [string]$ResumeSession,
     [switch]$ResumeStale,
     [switch]$SessionMenu,
     [string]$UnburnSession,
+    [string]$CleanupBurnedSession,
+    [Alias('ResetForkDepth')]
+    [string]$ResetForkCount,
     [switch]$ListBurned,
+    [switch]$CloseStaleTabs,
     [switch]$ListIgnored,
     [string]$UnignoreSession,
     [switch]$CaptureAll,
@@ -84,7 +93,24 @@ $Script:Cfg = @{
     ProcessId         = 'xray-core'
     ContinueText      = 'continue'
     RateLimitPattern  = '(Rate limit exceeded|Too many requests|Free usage limit reached|Free usage exceeded)'
-    QuotaBanPattern   = 'Free usage limit reached\. Subscribe to OpenCode Go to keep going: https://opencode\.ai/go'
+    # Free-usage quota classifier. The wording has changed between OpenCode
+    # releases ("Free usage limit reached. Free models work in OpenCode..."
+    # vs the older "Free usage limit reached. Subscribe to OpenCode Go..."),
+    # so match the stable prefix rather than one exact sentence. Despite the
+    # legacy name, this is only a classifier: a canary quota hit is treated
+    # like any other instant rate hit (auto-ban the target and switch further).
+    QuotaBanPattern   = '(?i)Free usage (?:limit reached|exceeded)'
+    # Provider-account credit exhaustion (OpenRouter: "This request requires more
+    # credits, or fewer max_tokens... adjust the key's total limit"). Not a rate
+    # limit and not server-related: no ban, no re-switch, skip fork/continue.
+    CreditsErrorPattern = '(?i)(requires more credits|can only afford|insufficient credit|key''s total limit)'
+    # The model the '.' canary must run on. A fresh probe session uses the
+    # configured default model (opencode.json "model"); when that entry is
+    # stale (model removed), the server silently falls back to another
+    # provider's default (seen: openrouter/... paid key, credits error) and
+    # the probe proves nothing. The canary therefore verifies the responding
+    # assistant's model and reports 'wrong-model' on a mismatch. Empty disables.
+    RateCanaryModel = 'opencode/glm-5.3-flash-free'
     EndpointPattern   = 'Endpoint is unavailable'
     ContinueDelaySec  = 5     # wait after app/service (re)connect before continue prompts
     RestartOpenCode   = $true
@@ -98,16 +124,52 @@ $Script:Cfg = @{
     SessionForkEnabled = $true
     SessionForkMaxDepth = 15    # fork-of-fork chain cap for one root session (manual UI fork ignores it)
     SessionForkMaxPerHour = 30  # safety valve against a switch/fork runaway
-    RateCanaryText     = '.'    # canary prompt sent to a brand-new session to test the freshly selected server
-    RateCanaryWaitSec  = 20     # how long to wait for the canary response before the verdict is 'timeout'
-    RateCanaryMaxAttempts = 3   # canary rounds per failover; each instant HIT auto-bans its server and switches again before any fork
+    # After the replacement fork accepts its continue prompt, delete the burned
+    # source session. A fork is linked by the `fork` field rather than parentID,
+    # so deleting the source does not delete the fork (its subagent children are
+    # removed with the source). Set $false to keep the [burned] source.
+    SessionRemoveBurned = $true
+    # Best-effort: focus the running desktop app and open the replacement fork
+    # through its command palette (Ctrl+K, exact session id, Enter). UI Automation
+    # locates and focuses the palette search Edit, and focus is verified before
+    # typing and before Enter. If UIA is unavailable, opening fails safe instead
+    # of risking the session id in the chat composer.
+    OpenForkInDesktop = $true
+    OpenForkSearchDelayMs = 1200
+    # Backstop for cleanup races: scan the desktop tab strip for tabs belonging
+    # to sessions recorded as deleted/gone and close them. The immediate close
+    # after a cleanup handles the normal case; this catches leftovers from an
+    # earlier run or an app that did not update a tab title. Live session titles
+    # are protected. Set 0 to disable the periodic sweep.
+    StaleTabSweepSec = 300
+    # The probe session is created in this temp sandbox with session-level
+    # permissions that deny every tool. It must reply with a fixed token and
+    # cannot read or modify the project. The session is interrupted as soon as
+    # the verdict is known (or the wait expires).
+    RateCanaryText     = 'Reply with exactly CANARY_OK. Do not use tools, read files, or run commands.'
+    RateCanaryWaitSec  = 15     # how long to wait for the canary response before the verdict is 'timeout'
+    RateCanaryDir      = (Join-Path $env:TEMP 'opencode-happ-canary')
+    RateCanaryMaxAttempts = 0   # 0 = no round cap: keep switching until a clean server; >0 = optional safety cap
     MaxSwitchAttempts = 6
     FailSkipMin       = 60     # servers whose last switch-verify failed are demoted for this many minutes
+    # A target that fails its post-switch exit check has no working tunnel. Ban
+    # it once another path proves the network works (the restored original or a
+    # later candidate), so rotation cannot keep reintroducing dead servers. A
+    # global/local outage therefore does not mass-ban the whole pool. Set $false
+    # to keep the old used-only behavior.
+    AutoBanFailedSwitch = $true
     ExitIpFreshMin    = 45     # demote servers whose last observed exit IP was still in use within this window (per-IP free-quota freshness)
     FastRetrySec       = 8     # shorter cooldown for another failure shortly after a switch
     ConsecutiveWindowSec = 180 # how long a follow-up failure counts as a consecutive timeout
     FastVerifyTries    = 2     # verification attempts after a fast switch
     FastVerifyTimeoutSec = 4   # curl timeout per fast verification attempt
+    # Normal/manual switch verification. The old 4 x 10s (plus a plain-route
+    # probe that ran even after a failed socks check) kept the dashboard frozen
+    # for ~56s on one dead server. A working tunnel answers on the first try;
+    # two short attempts are enough to ride out a transient.
+    VerifyTries        = 2
+    VerifyTimeoutSec   = 6
+    VerifyRetryDelayMs = 1000
     TunExe             = 'C:\Program Files\FlyFrogLLC\Happ\tun\sing-box.exe'
     TunConfigPath      = (Join-Path $env:LOCALAPPDATA 'Happ\config.json')
     # The TUN config forwards system traffic to this local socks port. Captured
@@ -120,8 +182,17 @@ $Script:Cfg = @{
     TunDns             = '1.1.1.1'
     OpenCodeExe       = "$env:LOCALAPPDATA\Programs\@opencodedesktop\OpenCode.exe"
     OpenCodeProcess   = 'OpenCode'
+    # CLI used for service restart and API calls. Empty = auto-resolve the CLI
+    # bundled with the desktop app (resources\opencode-cli.exe) or the newest
+    # staged copy under %APPDATA%\ai.opencode.desktop\cli. Never default to the
+    # npm `opencode` on PATH: an older npm CLI spawns a second, mismatched
+    # service that races the app's supervisor and can take the GUI down.
+    OpenCodeCli       = ''
     OpenCodeStopSec   = 20
     OpenCodeStartSec  = 120
+    # If the desktop process disappears during a service restart (it was running
+    # before the failover), relaunch it instead of reporting API-only success.
+    RecoverOpenCodeApp = $true
     HeartbeatSec      = 15
     WebCheckUrl       = 'https://api.ipify.org/?format=json'
     AffectedWindowMin = 120
@@ -130,6 +201,14 @@ $Script:Cfg = @{
     ConnResetWindowSec = 180    # count connection-loss failures within this window
     ConnResetMinCount  = 3      # threshold within the window -> full server failover
     ConnResetScanSec   = 20     # API-level scan cadence (ECONNRESET never reaches opencode.log)
+    # Closing the watchdog releases the owned core/TUN, so the active session can
+    # get an ECONNRESET and the system route can be dead while the VPN reconnects.
+    # On the next launch, give the first connection-loss failure one same-server
+    # continue and the first dead route one current-server restart before
+    # switching. The lookback also catches a failure recorded just before launch.
+    # Set the grace seconds to 0 to disable both startup retries.
+    StartupConnResetGraceSec = 300
+    StartupConnResetLookbackMin = 15
     TimeoutPattern     = '(?i)(timed out|timeout|ETIMEDOUT)'  # session-level provider timeout errors
     TimeoutInstantSec  = 120    # timeout within this window after our continue -> server is bad, ban it
     TunnelScanSec      = 30     # system-route health probe cadence
@@ -157,6 +236,12 @@ $Script:PendingWinW = -1
 $Script:PendingWinH = -1
 $Script:PendingWinAt = $null
 $Script:BansEditor = $null
+$Script:AllKnownServersCache = $null
+# >0 while Invoke-Failover owns the watch loop. Pump-BusyInput uses this to keep
+# [L] responsive (and to swallow stale [T]/[B]/[Q] bursts) during long waits.
+$Script:FailoverDepth = 0
+$Script:IgnoredBusyKeys = 0
+$Script:BusyIgnoreLogged = $false
 $Script:SuppressRender = $false
 $Script:Capture = $null
 # ANSI orange for automatic bans. Windows Terminal / modern conhost render
@@ -246,6 +331,63 @@ function Save-Bans {
         try { Remove-Item ($Script:Cfg.BansPath + '.tmp') -Force -ErrorAction SilentlyContinue } catch { }
     }
 }
+
+# ------------------------------------------------------------- console input
+# Long network waits run on the same thread as the dashboard. Windows queues
+# every key pressed during those waits; without draining them, a burst of [L]
+# opens and instantly closes the bans editor, and repeated [B]/[T] actions can
+# ban or switch twice. Clear-ConsoleInput drops the stale burst. Pump-BusyInput
+# keeps [L] usable while a failover is in progress.
+function Clear-ConsoleInput {
+    if (-not $Interactive) { return 0 }
+    $n = 0
+    try {
+        while ([Console]::KeyAvailable) {
+            [void][Console]::ReadKey($true)
+            $n++
+        }
+    } catch { }
+    return $n
+}
+
+function Pump-BusyInput {
+    if (-not $Interactive) { return }
+    if ([int]$Script:FailoverDepth -le 0) { return }
+    if ($Script:BansEditor -and $Script:BansEditor.Active) { return }
+    try {
+        $handled = 0
+        while ([Console]::KeyAvailable -and $handled -lt 8) {
+            $key = [Console]::ReadKey($true)
+            $handled++
+            if ($key.Key -eq 'L') {
+                # Opening the editor can take a moment on a cold cache. Drop the
+                # rest of this burst so the same held/repeated key cannot close
+                # the editor immediately after it appears.
+                $null = Clear-ConsoleInput
+                Start-BansEditor
+                return
+            }
+            $Script:IgnoredBusyKeys++
+        }
+        if ($handled -gt 0 -and -not $Script:BusyIgnoreLogged) {
+            $Script:BusyIgnoreLogged = $true
+            Log 'keys other than [L] are ignored while a failover is running (Ctrl+C exits immediately)'
+        }
+    } catch { }
+}
+
+function Wait-BusySlice {
+    param([int]$Milliseconds = 100)
+    $left = [Math]::Max(0, [int]$Milliseconds)
+    while ($left -gt 0) {
+        Pump-BusyInput
+        $step = [Math]::Min(100, $left)
+        Start-Sleep -Milliseconds $step
+        $left -= $step
+    }
+    Pump-BusyInput
+}
+
 function Get-ServerKey([object]$srv) {
     if (-not $srv -or -not $srv.host) { return $null }
     # A profile-aware server carries its own key (host:port#profileHash).
@@ -620,8 +762,9 @@ function Start-TunBurst {
     )
     $burst = New-Burst -messages $msgs -rids @('tun-start')
     if (-not $burst) { Log 'start-tun burst failed'; return $null }
-    Start-Sleep -Milliseconds $(if ($Fast) { 650 } else { 1200 })
+    Wait-BusySlice $(if ($Fast) { 650 } else { 1200 })
     $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs $(if ($Fast) { 900 } else { 2500 })
+    Pump-BusyInput
     foreach ($f in $resp) {
         if ($f.'request-id' -eq 'tun-start') { Log ("start-tun resp: status=" + $f.status + $(if ($f.message) { ' ' + $f.message } else { '' })) }
     }
@@ -631,7 +774,9 @@ function Start-TunBurst {
 function Get-PlainRouteIp {
     param([int]$TimeoutSec = 10)
     try {
+        Pump-BusyInput
         $raw = & curl.exe -s --max-time ([Math]::Max(1, [int]$TimeoutSec)) $Script:Cfg.WebCheckUrl 2>$null
+        Pump-BusyInput
         $joined = ($raw -join '')
         $ip = $null
         try { $ip = ($joined | ConvertFrom-Json).ip } catch { }
@@ -1768,6 +1913,7 @@ function Test-ProxyExit {
     $socksPort = Get-TunSocksPort
     $socksAddr = '127.0.0.1:' + $socksPort
     for ($i = 1; $i -le $tries; $i++) {
+        Pump-BusyInput
         try {
             $raw = & curl.exe -s --max-time $maxTime --socks5-hostname $socksAddr $Script:Cfg.WebCheckUrl 2>$null
             if ($LASTEXITCODE -eq 0) {
@@ -1787,7 +1933,8 @@ function Test-ProxyExit {
                 }
             }
         } catch { }
-        if ($i -lt $tries) { Start-Sleep -Milliseconds ([Math]::Max(0, [int]$RetryDelayMs)) }
+        Pump-BusyInput
+        if ($i -lt $tries) { Wait-BusySlice ([Math]::Max(0, [int]$RetryDelayMs)) }
     }
     return ''
 }
@@ -1832,11 +1979,11 @@ function Invoke-KillCore {
                 Log ("Stop-Process denied (" + $_.Exception.Message + ") - attempting elevated kill")
                 $cmd = 'Stop-Process -Id ' + $_.Id + ' -Force'
                 Start-Process powershell -Verb RunAs -WindowStyle Hidden -ArgumentList '-NoProfile', '-Command', $cmd
-                Start-Sleep -Seconds 3
+                Wait-BusySlice 3000
             }
         }
     } catch { Log ("kill failed: " + $_.Exception.Message); return $false }
-    Start-Sleep -Milliseconds 500
+    Wait-BusySlice 500
     return ((Get-Process xray -ErrorAction SilentlyContinue) -eq $null)
 }
 
@@ -1852,8 +1999,9 @@ function Start-CoreBurst {
     )
     $burst = New-Burst -messages $msgs -rids $rids
     if (-not $burst) { return $null }
-    Start-Sleep -Milliseconds $(if ($Fast) { 650 } else { 1200 })
+    Wait-BusySlice $(if ($Fast) { 650 } else { 1200 })
     $resp = Read-FramesFrom $burst.Client $burst.Recv -MaxMs $(if ($Fast) { 900 } else { 2500 })
+    Pump-BusyInput
     foreach ($f in $resp) {
         if ($f.status -and $f.'request-id' -eq 'start-switch') { Log ("start resp: status=" + $f.status + " " + $f.message) }
         if ($f.'request-id' -eq 'stdin-switch') { Log ("stdin resp: status=" + $f.status) }
@@ -1863,7 +2011,9 @@ function Start-CoreBurst {
 }
 
 function Invoke-PipeSwitch {
-    param([pscustomobject]$Target, [switch]$Fast)
+    param([pscustomobject]$Target, [switch]$Fast, [switch]$SameServer)
+    $Script:LastSwitchVerifyFailure = $null
+    $Script:LastSwitchReverted = $false
     Load-Bans
     $targetKey = Get-ServerKey $Target
     if (Test-ServerBanned $targetKey) {
@@ -1887,7 +2037,11 @@ function Invoke-PipeSwitch {
     $newJson = ConvertTo-Json -InputObject $newCfg -Compress -Depth 30
     $oldJson = ConvertTo-Json -InputObject (Set-ConfigSocksPort $template) -Compress -Depth 30
 
-    Log ("switching to {0}:{1} via daemon pipe (burst mode{2})..." -f $Target.host, $Target.port, $(if ($Fast) { ', fast' } else { '' }))
+    if ($SameServer) {
+        Log ("restarting current server {0}:{1} via daemon pipe (startup grace{2})..." -f $Target.host, $Target.port, $(if ($Fast) { ', fast' } else { '' }))
+    } else {
+        Log ("switching to {0}:{1} via daemon pipe (burst mode{2})..." -f $Target.host, $Target.port, $(if ($Fast) { ', fast' } else { '' }))
+    }
     $exitIpBefore = ''
     try { $exitIpBefore = [string]$Script:State.exitIp } catch { }
     if ($exitIpBefore) { Log ("last recorded exit IP before switch: " + $exitIpBefore) }
@@ -1895,7 +2049,7 @@ function Invoke-PipeSwitch {
     # 1. release any core we own, stop/kill the running core
     if ($Script:OwnedClient) { try { $Script:OwnedClient.Dispose() } catch {}; $Script:OwnedClient = $null }
     try { $null = (Send-Daemon -obj @{ action = 'stop'; 'process-id' = $Script:Cfg.ProcessId } -WaitMs $(if ($Fast) { 800 } else { 2000 })) } catch { }
-    Start-Sleep -Milliseconds $(if ($Fast) { 350 } else { 700 })
+    Wait-BusySlice $(if ($Fast) { 350 } else { 700 })
     $alive = Get-Process xray -ErrorAction SilentlyContinue
     if ($alive) {
         Log ('GUI-owned core still running - OS-level kill')
@@ -1906,32 +2060,41 @@ function Invoke-PipeSwitch {
         }
     }
     # 2. start with the new config; keep the owner connection open
+    Pump-BusyInput
     $Script:OwnedBurst = Start-CoreBurst -configJson $newJson -Fast:$Fast
     $Script:OwnedClient = if ($Script:OwnedBurst) { $Script:OwnedBurst.Client } else { $null }
     if (-not $Script:OwnedBurst) { Log 'burst start failed'; return $false }
     # 2b. restore the system-wide TUN (kills nothing: own burst, kept alive)
     if ($Script:OwnedTun) { try { $Script:OwnedTun.Client.Dispose() } catch {} }
     $Script:OwnedTun = Start-TunBurst -configPath $Script:Cfg.TunConfigPath -Fast:$Fast
-    Start-Sleep -Milliseconds $(if ($Fast) { 700 } else { 1500 })
+    Wait-BusySlice $(if ($Fast) { 700 } else { 1500 })
     $tun = Get-NetAdapter -ErrorAction SilentlyContinue | Where-Object { $_.Name -match 'happ' }
     if ($tun) { Log ("TUN adapter up: {0} ({1})" -f $tun.Name, $tun.Status) } else { Log 'WARNING: TUN adapter did not come up' }
-    # 3. verify (socks exit IP + the plain system-route IP)
+    # 3. verify (socks exit IP + the plain system-route IP). Do not spend a
+    # second timeout on the plain-route probe when the socks check already
+    # proved the server dead.
     if ($Fast) {
         $exitIpAfter = Test-ProxyExit -tries ([int]$Script:Cfg.FastVerifyTries) -TimeoutSec ([int]$Script:Cfg.FastVerifyTimeoutSec) -RetryDelayMs 400
         $plainIp = '(fast verify: skipped)'
     } else {
-        $exitIpAfter = Test-ProxyExit
-        $plainIp = Get-PlainRouteIp
+        $exitIpAfter = Test-ProxyExit -tries ([int]$Script:Cfg.VerifyTries) -TimeoutSec ([int]$Script:Cfg.VerifyTimeoutSec) -RetryDelayMs ([int]$Script:Cfg.VerifyRetryDelayMs)
+        if ($exitIpAfter) { $plainIp = Get-PlainRouteIp -TimeoutSec 5 } else { $plainIp = '(skipped: socks verify failed)' }
     }
     if ($exitIpAfter) {
-        Log ("SWITCH OK -> {0}:{1} (core exit IP: {2}{3}; system route: {4})" -f $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
-        $global:LastSwitchAt = Get-Date
+        $okLabel = if ($SameServer) { 'CURRENT SERVER OK' } else { 'SWITCH OK' }
+        Log ("{0} -> {1}:{2} (core exit IP: {3}{4}; system route: {5})" -f $okLabel, $Target.host, $Target.port, $exitIpAfter, $(if ($exitIpBefore -and $exitIpBefore -ne $exitIpAfter) { ", was: $exitIpBefore" } else { '' }), $plainIp)
+        if (-not $SameServer) { $global:LastSwitchAt = Get-Date }
         Update-Reliability (Get-ServerKey $Target) $true $exitIpAfter
         Set-ActiveServer $Target
         return $true
     }
     Update-Reliability (Get-ServerKey $Target) $false
-    Log 'exit check failed on the new server - checking whether the original config can be restored'
+    $Script:LastSwitchVerifyFailure = $targetKey
+    if ($SameServer) {
+        Log 'exit check failed on the current server config - checking whether the original config can be restored'
+    } else {
+        Log 'exit check failed on the new server - checking whether the original config can be restored'
+    }
     if ($Script:OwnedBurst) { try { $Script:OwnedBurst.Client.Dispose() } catch {} }
     $Script:OwnedClient = $null; $Script:OwnedBurst = $null
     $null = Invoke-KillCore
@@ -1956,27 +2119,120 @@ function Invoke-PipeSwitch {
     $Script:OwnedBurst = Start-CoreBurst -configJson $oldJson -Fast:$Fast
     $Script:OwnedClient = if ($Script:OwnedBurst) { $Script:OwnedBurst.Client } else { $null }
     # TUN stays alive across the revert (it forwards into the fixed socks port)
-    $revertOk = $false
+    $revertIp = ''
     if ($Script:OwnedBurst) {
         if ($Fast) {
-            $revertOk = [bool](Test-ProxyExit -tries 1 -TimeoutSec ([int]$Script:Cfg.FastVerifyTimeoutSec))
+            $revertIp = Test-ProxyExit -tries 1 -TimeoutSec ([int]$Script:Cfg.FastVerifyTimeoutSec)
         } else {
-            $revertOk = [bool](Test-ProxyExit)
+            $revertIp = Test-ProxyExit -tries ([int]$Script:Cfg.VerifyTries) -TimeoutSec ([int]$Script:Cfg.VerifyTimeoutSec) -RetryDelayMs ([int]$Script:Cfg.VerifyRetryDelayMs)
         }
     }
-    if ($revertOk) {
+    if ($revertIp) {
+        $Script:LastSwitchReverted = $true
         if ($curSrv) { Set-ActiveServer $curSrv }
         Log 'reverted to original server'
+        if ($SameServer) {
+            # The rebuilt config failed, but the original config for the same
+            # server verified. That still proves the old route works.
+            $Script:LastSwitchVerifyFailure = $null
+            if ($curSrv) { Update-Reliability (Get-ServerKey $curSrv) $true $revertIp }
+            Log 'current server reachable with its original config - keeping it'
+            return $true
+        }
     } else { Log 'REVERT FAILED - reconnect Happ manually!' }
     return $false
 }
 
 # ------------------------------------------------------------------- opencode helpers
+# The watchdog must drive the same CLI build as the desktop app. The npm
+# `opencode` on PATH can be an older release; using it for `service restart`
+# spawns a second, mismatched service that races the app's own supervisor and
+# can take the GUI down (2026-10-25 05:09: npm 2.0.26 vs app 2.0.27).
+function Get-OpencodeCli {
+    if ($Script:OcCliPath -and (Test-Path -LiteralPath $Script:OcCliPath)) {
+        return $Script:OcCliPath
+    }
+
+    $candidates = @()
+    if ($Script:Cfg.OpenCodeCli) { $candidates += [string]$Script:Cfg.OpenCodeCli }
+
+    $stagedRoot = Join-Path $env:APPDATA 'ai.opencode.desktop\cli'
+
+    $appExe = $null
+    try {
+        $app = @(Get-OpenCodeDesktopProcess) | Where-Object { $_.Path } | Select-Object -First 1
+        if ($app) { $appExe = $app.Path }
+    } catch { }
+    if (-not $appExe) { $appExe = [string]$Script:Cfg.OpenCodeExe }
+    if ($appExe) {
+        $appDir = Split-Path $appExe -Parent
+        if ($appDir) { $candidates += (Join-Path $appDir 'resources\opencode-cli.exe') }
+    }
+
+    $staged = @(Get-ChildItem -LiteralPath $stagedRoot -Directory -ErrorAction SilentlyContinue |
+        Where-Object { Test-Path -LiteralPath (Join-Path $_.FullName 'opencode-cli.exe') } |
+        Sort-Object @{ Expression = { try { [version]$_.Name } catch { [version]'0.0.0' } } } -Descending)
+    foreach ($dir in $staged) {
+        $candidates += (Join-Path $dir.FullName 'opencode-cli.exe')
+    }
+
+    foreach ($path in $candidates) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            $Script:OcCliPath = $path
+            Log ("opencode CLI: " + $path)
+            return $path
+        }
+    }
+
+    $cmd = Get-Command opencode -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) {
+        $Script:OcCliPath = $cmd.Source
+        Log ("WARNING: desktop opencode CLI not found - falling back to PATH opencode (" + $cmd.Source + "); a version mismatch can still race the desktop service")
+        return $cmd.Source
+    }
+    Log 'WARNING: no opencode CLI found - API calls and service restarts will fail'
+    return 'opencode'
+}
+
+function Get-OpencodeCliVersion {
+    $cli = Get-OpencodeCli
+    if ($Script:OcCliVersion -and $Script:OcCliVersionFor -eq $cli) {
+        return $Script:OcCliVersion
+    }
+    # Staged desktop CLI lives in ...\cli\<version>\opencode-cli.exe.
+    $parent = Split-Path $cli -Parent
+    if ($parent) {
+        $leaf = Split-Path $parent -Leaf
+        try {
+            $null = [version]$leaf
+            $Script:OcCliVersion = $leaf
+            $Script:OcCliVersionFor = $cli
+            return $leaf
+        } catch { }
+    }
+    try {
+        $out = & $cli --version 2>$null
+        if ($LASTEXITCODE -eq 0 -and (($out -join ' ') -match '(\d+\.\d+\.\d+)')) {
+            $Script:OcCliVersion = $Matches[1]
+            $Script:OcCliVersionFor = $cli
+            return $Script:OcCliVersion
+        }
+    } catch { }
+    return $null
+}
+
+function Get-OpenCodeServiceInfo {
+    $path = Join-Path $env:USERPROFILE '.local\state\opencode\service.json'
+    if (-not (Test-Path -LiteralPath $path)) { return $null }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json) } catch { return $null }
+}
+
 function Invoke-OC {
     param([string]$api)
     Push-Location $Script:Cfg.ProjectDir
     try {
-        $out = & opencode api get $api 2>$null
+        $cli = Get-OpencodeCli
+        $out = & $cli api get $api 2>$null
         if ($LASTEXITCODE -ne 0) { return $null }
         $raw = ($out -join "`n")
         try { return ($raw | ConvertFrom-Json) } catch { return $null }
@@ -2017,11 +2273,26 @@ function Get-FailedSessions {
         # not our 'continue' and not opencode's restart note) means the session
         # moved on and we should leave it alone. Idle/system markers and error-less
         # assistant records are translucent: they must not mask an older failure.
+        #
+        # Fork boundary: lock the error group at the first user message (including
+        # our 'continue' prompts), then use the oldest recognized error in that
+        # turn. Forking with {"before": <messageID>} keeps all earlier actions but
+        # excludes the failure and its duplicate idle record.
         $errKind = $null; $errMsg = $null; $errCreated = $null; $errQuota = $false
+        $errMsgID = ''
+        $turnErrMsgIDs = New-Object System.Collections.Generic.List[string]
+        $turnLocked = $false
         foreach ($m in $msgsResp.data) {
             if ($m.type -eq 'user') {
                 $txt = ''
-                try { $txt = ([string]$m.payload.text) } catch { $txt = '' }
+                try { $txt = [string]$m.text } catch { $txt = '' }
+                if (-not $txt) { try { $txt = [string]$m.payload.text } catch { $txt = '' } }
+                if (-not $txt) { try { $txt = [string]$m.metadata.displayText } catch { $txt = '' } }
+                if ($errKind -and -not $turnLocked) {
+                    if ($turnErrMsgIDs.Count -gt 0) { $errMsgID = [string]$turnErrMsgIDs[$turnErrMsgIDs.Count - 1] }
+                    $turnLocked = $true
+                }
+                $turnErrMsgIDs.Clear()
                 if ($txt -and $txt -notmatch '^(continue|The server restarted while you were working)') { break }
                 continue
             }
@@ -2034,17 +2305,28 @@ function Get-FailedSessions {
                         $kind = 'rate'
                         $quotaHit = [bool]($m.error.message -match $Script:Cfg.QuotaBanPattern)
                     }
+                    # Provider-account credit errors (OpenRouter key limit) are
+                    # tracked as rate-kind too: nothing is banned because of
+                    # them, but the sessions stay visible and auto-resume once
+                    # the key's credit limit is raised.
+                    elseif ($m.error.message -match $Script:Cfg.CreditsErrorPattern) { $kind = 'rate' }
                     elseif ($m.error.message -match $Script:Cfg.EndpointPattern) { $kind = 'endpoint' }
                     elseif ($m.error.message -match $Script:Cfg.ConnResetPattern) { $kind = 'connreset' }
                     elseif ($m.error.message -match $Script:Cfg.TimeoutPattern) { $kind = 'timeout' }
                 }
-                if ($kind -and ($kinds -contains $kind) -and (-not $errKind)) {
-                    $errKind = $kind
-                    $errQuota = $quotaHit
-                    $errMsg = $m.error.message.Substring(0, [Math]::Min(140, $m.error.message.Length))
-                    try { $errCreated = [int64]$m.time.created } catch { $errCreated = $null }
+                if ($kind -and ($kinds -contains $kind)) {
+                    if (-not $errKind) {
+                        $errKind = $kind
+                        $errQuota = $quotaHit
+                        $errMsg = $m.error.message.Substring(0, [Math]::Min(140, $m.error.message.Length))
+                        try { $errCreated = [int64]$m.time.created } catch { $errCreated = $null }
+                    }
+                    if (-not $turnLocked) { $turnErrMsgIDs.Add([string]$m.id) }
                 }
             }
+        }
+        if ($errKind -and -not $turnLocked -and $turnErrMsgIDs.Count -gt 0) {
+            $errMsgID = [string]$turnErrMsgIDs[$turnErrMsgIDs.Count - 1]
         }
         if (-not $errKind) { continue }
         # A fork copies the transcript, including the failure that created it.
@@ -2085,6 +2367,7 @@ function Get-FailedSessions {
         $result += [pscustomobject]@{
             id = $s.id; title = $s.title; when = $updated; kind = $errKind
             errCreated = $errCreated
+            errMsgID = $errMsgID
             quota = $errQuota
             msg = $errMsg
         }
@@ -2097,12 +2380,43 @@ function Get-OpenCodeDesktopProcess {
 }
 
 function Get-OpenCodeServiceProcess {
-    # opencode desktop ships its own service binary; it can outlive the GUI when
-    # the app is force-closed, so treat it as part of the app for restarts.
-    $cliDir = Join-Path $env:APPDATA 'ai.opencode.desktop\cli'
-    return @(Get-Process -Name 'opencode-cli' -ErrorAction SilentlyContinue | Where-Object {
-        try { $_.Path -and $_.Path.StartsWith($cliDir, [System.StringComparison]::OrdinalIgnoreCase) } catch { $false }
-    })
+    # Both the desktop-staged CLI (opencode-cli.exe) and a globally installed
+    # npm CLI (opencode.exe under ...\@opencode\cli) can run the background
+    # service. The npm one is invisible to an appdata-only filter and can win
+    # the service.json registration race after `service restart`, so include it.
+    # Match `serve --service` only: one-shot `api` calls and interactive TUIs
+    # must not be mistaken for a leftover service.
+    $roots = @(
+        (Join-Path $env:APPDATA 'ai.opencode.desktop\cli'),
+        (Join-Path $env:APPDATA 'npm\node_modules\@opencode\cli'),
+        (Join-Path $env:LOCALAPPDATA 'npm\node_modules\@opencode\cli'),
+        (Join-Path $env:LOCALAPPDATA 'Programs\@opencodedesktop\resources')
+    )
+    $result = @()
+    $procs = @(Get-CimInstance Win32_Process -Filter "Name='opencode-cli.exe' OR Name='opencode.exe'" -ErrorAction SilentlyContinue)
+    foreach ($p in $procs) {
+        $path = [string]$p.ExecutablePath
+        if (-not $path) { continue }
+        $underRoot = $false
+        foreach ($root in $roots) {
+            if ($path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) { $underRoot = $true; break }
+        }
+        if (-not $underRoot) { continue }
+        if ($p.CommandLine) {
+            if ([string]$p.CommandLine -notmatch 'serve\s+--service') { continue }
+        } elseif ([string]$p.Name -ne 'opencode-cli.exe') {
+            # Command line unavailable (protected process): keep the old
+            # desktop-CLI behaviour, but do not guess for npm opencode.exe.
+            continue
+        }
+        $result += [pscustomobject]@{
+            Id          = [int]$p.ProcessId
+            ProcessName = [System.IO.Path]::GetFileNameWithoutExtension([string]$p.Name)
+            Path        = $path
+            CommandLine = [string]$p.CommandLine
+        }
+    }
+    return $result
 }
 
 function Get-OpenCodeLeftover {
@@ -2134,7 +2448,7 @@ function Stop-OpencodeDesktop {
         if ($Fast) { $graceSec = [Math]::Min(4, $graceSec) }
         $deadline = (Get-Date).AddSeconds($graceSec)
         while ((Get-Date) -lt $deadline) {
-            Start-Sleep -Milliseconds 500
+            Wait-BusySlice 500
             if (-not @(Get-OpenCodeLeftover).Count) {
                 Log 'opencode desktop closed gracefully'
                 return $true
@@ -2153,7 +2467,7 @@ function Stop-OpencodeDesktop {
                 Log ("could not stop opencode pid " + $p.Id + ": " + $_.Exception.Message)
             }
         }
-        Start-Sleep -Milliseconds 400
+        Wait-BusySlice 400
     }
     foreach ($p in @(Get-OpenCodeServiceProcess)) {
         try { Stop-Process -Id $p.Id -Force -ErrorAction Stop } catch {
@@ -2161,7 +2475,7 @@ function Stop-OpencodeDesktop {
         }
     }
     for ($i = 0; $i -lt 10; $i++) {
-        Start-Sleep -Milliseconds 500
+        Wait-BusySlice 500
         if (-not @(Get-OpenCodeLeftover).Count) {
             Log 'opencode desktop stopped'
             return $true
@@ -2203,7 +2517,7 @@ function Start-OpencodeDesktop {
     }
 
     for ($i = 1; $i -le [int]$Script:Cfg.OpenCodeStartSec; $i++) {
-        Start-Sleep -Seconds 1
+        Wait-BusySlice 1000
         $info = Invoke-OC '/api/info'
         # /api/info returns the ServerInfo object directly (no data wrapper)
         if ($info -and ($info.data -or $info.version)) {
@@ -2223,23 +2537,66 @@ function Start-OpencodeDesktop {
 }
 
 function Restart-OpencodeService {
+    param([bool]$DesktopWasRunning = $false)
     Push-Location $Script:Cfg.ProjectDir
     try {
-        Log 'restarting opencode background service...'
-        & opencode service restart 2>$null | Out-Null
+        # Callers that know the pre-failover state pass it in; a direct call
+        # (e.g. the desktop-exe fallback) samples it here.
+        $desktopBefore = $DesktopWasRunning
+        if (-not $PSBoundParameters.ContainsKey('DesktopWasRunning')) {
+            $desktopBefore = @(Get-OpenCodeDesktopProcess).Count -gt 0
+        }
+
+        $cli = Get-OpencodeCli
+        $cliVer = Get-OpencodeCliVersion
+        $verNote = if ($cliVer) { " (v" + $cliVer + ")" } else { '' }
+        Log ("restarting opencode background service via " + $cli + $verNote + "...")
+        Pump-BusyInput
+        & $cli service restart 2>$null | Out-Null
+        Pump-BusyInput
+        $healthy = $false
         for ($i = 1; $i -le 120; $i++) {
-            Start-Sleep -Seconds 1
+            Wait-BusySlice 1000
             $info = Invoke-OC '/api/info'
             if ($info -and ($info.data -or $info.version)) {
                 Log ("opencode service healthy after " + $i + "s (pid " + $(if ($info.data) { $info.data.pid } else { $info.pid }) + ")")
-                return $true
+                $healthy = $true
+                break
             }
             if (($i % 15) -eq 0) {
                 Log ("still waiting for the opencode service (" + $i + "s of 120s)...")
             }
         }
-        Log 'opencode service failed to come back'
-        return $false
+        if (-not $healthy) {
+            Log 'opencode service failed to come back'
+            return $false
+        }
+
+        # /api/info can be served by the background service while the Electron
+        # window is gone (2026-10-25 05:09: the npm 2.0.26 service won the
+        # registration race, the app exited, and the health check still passed).
+        # If the app was running before the failover, require it after restart.
+        if ($desktopBefore -and -not @(Get-OpenCodeDesktopProcess).Count) {
+            Log 'opencode service is up but the desktop app disappeared during the restart'
+            if ($Script:Cfg.RecoverOpenCodeApp -and (Test-Path -LiteralPath $Script:Cfg.OpenCodeExe)) {
+                Log 'relaunching the opencode desktop app...'
+                if (Start-OpencodeDesktop) { return $true }
+            } elseif (-not $Script:Cfg.RecoverOpenCodeApp) {
+                Log 'automatic desktop recovery is disabled (RecoverOpenCodeApp = $false)'
+            } else {
+                Log ("cannot relaunch the desktop app - OpenCodeExe not found at " + $Script:Cfg.OpenCodeExe)
+            }
+            Log 'opencode desktop could not be recovered after the service restart'
+            return $false
+        }
+
+        # Defense in depth: with a matching CLI this should never trigger, but a
+        # stale service left by an older npm CLI would still be a landmine.
+        $svc = Get-OpenCodeServiceInfo
+        if ($svc -and $svc.version -and $cliVer -and ([string]$svc.version -ne [string]$cliVer)) {
+            Log ("WARNING: registered service is v" + $svc.version + " but this watchdog uses v" + $cliVer + " - version skew can race the desktop app and drop the GUI")
+        }
+        return $true
     } finally { Pop-Location }
 }
 
@@ -2248,10 +2605,10 @@ function Send-ContinueToSession {
     if (-not $Text) { $Text = [string]$Script:Cfg.ContinueText }
     Push-Location $Script:Cfg.ProjectDir
     try {
-        # PS5.1 loses embedded quotes when the npm shim spawns the native exe;
+        # PS5.1 strips embedded quotes when passing JSON to a native exe;
         # pre-escape quotes so the payload arrives as valid JSON.
         $body = '{\"text\":\"' + (([string]$Text) -replace '"', '\\\"') + '\"}'
-        $out = & opencode api post ("/api/session/{0}/prompt" -f $sessionID) --data $body 2>&1
+        $out = & (Get-OpencodeCli) api post ("/api/session/{0}/prompt" -f $sessionID) --data $body 2>&1
         $txt = (($out -join ' ') -replace '\s+', ' ')
         if ($txt.Length -gt 160) { $txt = $txt.Substring(0, 160) }
         Log ("continue ({0}) -> {1}: {2}" -f $Text, $sessionID, $txt)
@@ -2259,11 +2616,88 @@ function Send-ContinueToSession {
     } finally { Pop-Location }
 }
 
-# ------------------------------------------------------------ '.' rate canary
+function Stop-RateCanarySession {
+    param([string]$sessionID)
+    if (-not $sessionID) { return $false }
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        $out = & (Get-OpencodeCli) api post ("/api/session/{0}/interrupt" -f $sessionID) 2>&1
+        if ($LASTEXITCODE -ne 0) {
+            $txt = (($out -join ' ') -replace '\s+', ' ')
+            if ($txt.Length -gt 160) { $txt = $txt.Substring(0, 160) }
+            Log ("canary interrupt failed for {0}: {1}" -f $sessionID, $txt)
+            return $false
+        }
+        return $true
+    } catch {
+        Log ("canary interrupt error for {0}: {1}" -f $sessionID, $_.Exception.Message)
+        return $false
+    } finally { Pop-Location }
+}
+
+function New-RateCanarySession {
+    param([string]$Context = 'failover')
+    $sandbox = [string]$Script:Cfg.RateCanaryDir
+    if (-not $sandbox) { $sandbox = Join-Path $env:TEMP 'opencode-happ-canary' }
+    New-Item -ItemType Directory -Path $sandbox -Force | Out-Null
+    $body = [ordered]@{
+        location = @{ directory = $sandbox }
+        permissions = @(
+            @{ action = '*'; resource = '*'; effect = 'deny' }
+        )
+    }
+    $modelText = [string]$Script:Cfg.RateCanaryModel
+    if ($modelText) {
+        $parts = $modelText.Split('/', 2)
+        if ($parts.Count -eq 2 -and $parts[0] -and $parts[1]) {
+            $modelID = [string]$parts[1]
+            $variant = ''
+            $hash = $modelID.IndexOf('#')
+            if ($hash -ge 0) {
+                $variant = $modelID.Substring($hash + 1)
+                $modelID = $modelID.Substring(0, $hash)
+            }
+            $modelRef = [ordered]@{ providerID = [string]$parts[0]; id = $modelID }
+            if ($variant) { $modelRef.variant = $variant }
+            $body.model = $modelRef
+        }
+    }
+    $bodyJson = $body | ConvertTo-Json -Compress -Depth 8
+    # PS5.1 strips embedded quotes when passing JSON to a native exe.
+    $bodyArg = $bodyJson -replace '"', '\"'
+    $new = (& (Get-OpencodeCli) api post /api/session --data $bodyArg 2>&1) -join "`n"
+    $sess = $null
+    try { $sess = $new | ConvertFrom-Json } catch { }
+    $info = $null
+    if ($sess -and $sess.data) { $info = $sess.data } elseif ($sess) { $info = $sess }
+    $sid = $null
+    if ($info -and $info.id) { $sid = [string]$info.id }
+    if (-not $sid) {
+        Log ("rate canary ({0}): could not create the sandbox probe session - no verdict" -f $Context)
+        return $null
+    }
+    $Script:LastCanarySessionID = $sid
+    $denied = $false
+    try {
+        $denied = @($info.permissions | Where-Object {
+            [string]$_.action -eq '*' -and [string]$_.resource -eq '*' -and [string]$_.effect -eq 'deny'
+        }).Count -gt 0
+    } catch { }
+    if (-not $denied) {
+        Log ("rate canary ({0}): SECURITY - probe session {1} did not accept deny-all permissions; aborting before any prompt" -f $Context, $sid)
+        Stop-RateCanarySession $sid | Out-Null
+        return $null
+    }
+    Log ("rate canary ({0}): sandbox probe session {1} created (dir: {2}; model: {3}; tools: denied)" -f $Context, $sid, $sandbox, $(if ($modelText) { $modelText } else { 'default' }))
+    return $info
+}
+
+# ------------------------------------------------------- sandboxed rate canary
 # After a server switch the provider may still be throttling (account-wide) or
-# may have settled (per-session flag only). A brand-new session carries no
-# transcript and no session-bound quota flag, so one '.' prompt there is the
-# cleanest probe: its first response shows whether the limit is still live.
+# may have settled (per-session flag only). A brand-new sandboxed session
+# carries no transcript and no session-bound quota flag, so one fixed
+# CANARY_OK prompt there is the cleanest probe: its first response shows
+# whether the limit is still live, without exposing project tools or files.
 # A 'hit' verdict hands the failover a reason to auto-ban that server and
 # switch to the next one; only a canary that comes out ok unlocks the
 # fork/continue phase (see the gate loop in Invoke-Failover).
@@ -2271,16 +2705,11 @@ function Test-RateCanary {
     param([string]$context = 'failover')
     Push-Location $Script:Cfg.ProjectDir
     try {
-        $new = (& opencode api post /api/session --data '{}' 2>&1) -join "`n"
-        $sess = $null
-        try { $sess = $new | ConvertFrom-Json } catch { }
-        $sid = $null
-        if ($sess -and $sess.data -and $sess.data.id) { $sid = $sess.data.id }
-        elseif ($sess -and $sess.id) { $sid = $sess.id }
-        if (-not $sid) {
-            Log ("rate canary ({0}): could not create the probe session - no verdict" -f $context)
-            return $null
-        }
+        $Script:LastCanarySessionID = $null
+        $probeSession = New-RateCanarySession -Context $context
+        if (-not $probeSession) { return $null }
+        $sid = [string]$probeSession.id
+        $Script:LastCanarySessionID = $sid
         # The probe session must never be scanned, resumed, or burned by the
         # watchdog itself - record it as ignored (reason rate-canary) in state.
         if (-not $Script:State) { Load-State }
@@ -2297,12 +2726,16 @@ function Test-RateCanary {
         $deadline = [DateTime]::UtcNow.AddSeconds([double]$Script:Cfg.RateCanaryWaitSec)
         $errText = $null
         $clean = $false
+        $probeModel = ''
         while ([DateTime]::UtcNow -lt $deadline) {
-            Start-Sleep -Seconds 2
+            Wait-BusySlice 2000
+            Pump-BusyInput
             $msgs = Invoke-OC ("/api/session/{0}/message?order=desc&limit=8" -f $sid)
+            Pump-BusyInput
             if (-not $msgs -or -not $msgs.data) { continue }
             foreach ($m in $msgs.data) {
                 if ($m.type -ne 'assistant' -and $m.type -ne 'idle') { continue }
+                try { if ($m.model -and $m.model.id -and -not $probeModel) { $probeModel = ('{0}/{1}' -f $m.model.providerID, $m.model.id) } } catch { }
                 if ($m.error -and $m.error.message) {
                     $errText = [string]$m.error.message
                     break
@@ -2312,8 +2745,29 @@ function Test-RateCanary {
             }
             if ($errText -or $clean) { break }
         }
+        # Surprise-model guard: a stale "model" entry in opencode.json makes the
+        # server silently fall back to another provider's default for fresh
+        # sessions, so a probe can run somewhere entirely unrelated (seen: a
+        # paid openrouter model whose workspace key blocks every request).
+        # Evidence from the wrong model must not qualify the server for forks.
+        $expected = ''
+        try { $expected = ([string]$Script:Cfg.RateCanaryModel) -replace '#.*$', '' } catch { }
+        if ($expected -and $probeModel -and ($probeModel -ne $expected)) {
+            Log ("rate canary ({0}): WRONG-MODEL - probe session {1} ran on {2} instead of {3}; probe evidence is invalid, nothing will be banned" -f $context, $sid, $probeModel, $expected)
+            return @{ verdict = 'wrong-model'; id = $sid; msg = $errText; model = $probeModel }
+        }
         if ($errText) {
             if ($errText.Length -gt 140) { $errText = $errText.Substring(0, 140) }
+            # A provider-account credit error ("This request requires more
+            # credits, or fewer max_tokens... adjust the key's total limit") is
+            # neither a rate limit nor evidence against the server: any request
+            # on this key fails the same way, so the canary cannot probe at all
+            # through it. Verdict 'credits' tells the gate to skip the
+            # fork/continue phase without banning or re-switching.
+            if ($errText -match $Script:Cfg.CreditsErrorPattern) {
+                Log ("rate canary ({0}): CREDITS - probe session {1} hit a provider credit error ({2}); this is an account/key problem, not a server one" -f $context, $sid, $errText)
+                return @{ verdict = 'credits'; id = $sid; msg = $errText }
+            }
             if ($errText -match $Script:Cfg.RateLimitPattern) {
                 Log ("rate canary ({0}): HIT - probe session {1} hit the rate limit ({2}); the limit is live account-wide, not session-bound" -f $context, $sid, $errText)
             } else {
@@ -2390,6 +2844,61 @@ function Get-ForkCountSince([datetime]$since) {
     return $n
 }
 
+function Reset-SessionForkCount([string]$sessionID) {
+    # Reset the per-chain depth counter, not the global hourly valve. A burned
+    # source can be named too: follow its recorded fork links to the live tip,
+    # which is the session that will be forked on the next automatic resume.
+    if (-not $sessionID) { return $false }
+    if (-not $Script:State) { Load-State }
+    $startID = $sessionID.Trim()
+    if (-not $startID) { return $false }
+    $startRec = Get-SessionRec $startID
+    if (-not $startRec) {
+        Log ("no fork record for session {0} - nothing to reset (no forks have been recorded for it)" -f $startID)
+        return $false
+    }
+
+    $targetID = $startID
+    $seen = @{}
+    while ($targetID -and -not $seen.ContainsKey($targetID)) {
+        $seen[$targetID] = $true
+        $cur = Get-SessionRec $targetID
+        if (-not $cur) { break }
+        $nextID = ''
+        try { $nextID = [string]$cur.forkID } catch { }
+        if (-not $nextID -or $nextID -eq $targetID) { break }
+        $targetID = $nextID
+    }
+    $targetRec = Get-SessionRec $targetID
+    if (-not $targetRec) {
+        $targetID = $startID
+        $targetRec = $startRec
+        Log ("recorded fork chain from {0} ends at a missing session - resetting {0} instead" -f $startID)
+    }
+
+    $oldDepth = 0
+    try {
+        if ($targetRec.PSObject.Properties['depth'] -and $null -ne $targetRec.depth) {
+            $oldDepth = [int]$targetRec.depth
+        }
+    } catch { }
+    $oldRoot = ''
+    try { $oldRoot = [string]$targetRec.rootID } catch { }
+    if (-not $oldRoot) { $oldRoot = '?' }
+    Add-Member -InputObject $targetRec -NotePropertyName depth -NotePropertyValue 0 -Force
+    Add-Member -InputObject $targetRec -NotePropertyName rootID -NotePropertyValue $targetID -Force
+    Add-Member -InputObject $targetRec -NotePropertyName forkResetAt -NotePropertyValue ((Get-Date).ToString('o')) -Force
+    Add-Member -InputObject $targetRec -NotePropertyName forkResetDepth -NotePropertyValue $oldDepth -Force
+    Save-State
+
+    if ($targetID -ne $startID) {
+        Log ("fork counter reset for {0}: live tip {1}; count {2} -> 0; root {3} -> {1}" -f $startID, $targetID, $oldDepth, $oldRoot)
+    } else {
+        Log ("fork counter reset for {0}: count {1} -> 0; root {2} -> {0}" -f $startID, $oldDepth, $oldRoot)
+    }
+    return $true
+}
+
 function Set-SessionTitle {
     param([string]$sessionID, [string]$title)
     if (-not $sessionID -or -not $title) { return $false }
@@ -2397,12 +2906,12 @@ function Set-SessionTitle {
     if ($clean.Length -gt 120) { $clean = $clean.Substring(0, 120) }
     Push-Location $Script:Cfg.ProjectDir
     try {
-        # PS5.1 + the npm shim split --data at literal spaces. JSON \u0020
+        # PS5.1 + a native exe split --data at literal spaces. JSON \u0020
         # escapes keep the payload one argv token and still decode to a space.
         $json = @{ title = $clean } | ConvertTo-Json -Compress
         $json = $json.Replace(' ', '\u0020')
         $body = $json.Replace('"', '\"')
-        $out = & opencode api patch ("/api/session/{0}" -f $sessionID) --data $body 2>&1
+        $out = & (Get-OpencodeCli) api patch ("/api/session/{0}" -f $sessionID) --data $body 2>&1
         if ($LASTEXITCODE -ne 0) {
             $msg = (($out -join ' ') -replace '\s+', ' ')
             if ($msg.Length -gt 140) { $msg = $msg.Substring(0, 140) }
@@ -2416,12 +2925,469 @@ function Set-SessionTitle {
     } finally { Pop-Location }
 }
 
+# ------------------------------------------- desktop fork opening (best effort)
+# The desktop app has no session deep-link. Its command palette does exact
+# session-id lookup, so focus the window, send Ctrl+K, type the fork id and press
+# Enter. UI Automation verifies the palette and its focused search Edit before
+# any keys are typed; if that is unavailable, opening fails safe instead of
+# risking the id in the chat composer.
+function Initialize-DesktopWindowApi {
+    if ('OcDesktopWin' -as [type]) {
+        $Script:DesktopWindowApiReady = $true
+        return $true
+    }
+    try {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+public class OcDesktopWin {
+    [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);
+    [DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();
+    [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    [DllImport("user32.dll")] public static extern bool AttachThreadInput(uint idAttach, uint idAttachTo, bool fAttach);
+    [DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);
+    [DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();
+}
+'@
+        $Script:DesktopWindowApiReady = $true
+        return $true
+    } catch {
+        Log ("desktop window API init failed: {0}" -f $_.Exception.Message)
+        return $false
+    }
+}
+
+function Initialize-UiAutomation {
+    if ($Script:UiaInitialized) { return [bool]$Script:UiaAvailable }
+    $Script:UiaInitialized = $true
+    try {
+        Add-Type -AssemblyName UIAutomationClient
+        Add-Type -AssemblyName UIAutomationTypes
+        $Script:UiaAvailable = $true
+    } catch {
+        $Script:UiaAvailable = $false
+        Log ("desktop palette UI automation unavailable: {0}" -f $_.Exception.Message)
+    }
+    return [bool]$Script:UiaAvailable
+}
+
+function Get-UiPaletteEdit {
+    param([IntPtr]$Handle)
+    if ($Handle -eq [IntPtr]::Zero) { return $null }
+    if (-not (Initialize-UiAutomation)) { return $null }
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+        if (-not $root) { return $null }
+        $nameCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            'Search files, commands, and sessions')
+        $matches = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $nameCond)
+        for ($i = 0; $i -lt $matches.Count; $i++) {
+            $e = $matches.Item($i)
+            if ($e.Current.ControlType -eq [System.Windows.Automation.ControlType]::Edit) { return $e }
+        }
+        # Locale/UI wording can change without changing the control type. Only
+        # trust an Edit whose name looks like the palette search box; the chat
+        # composer does not start with "search".
+        $editCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Edit)
+        $edits = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $editCond)
+        for ($i = 0; $i -lt $edits.Count; $i++) {
+            $e = $edits.Item($i)
+            $editName = [string]$e.Current.Name
+            if ($editName -match '(?i)^search\b' -and $editName -match '(?i)(commands|sessions|files)') {
+                return $e
+            }
+        }
+    } catch { }
+    return $null
+}
+
+function Set-UiAppDocumentFocus {
+    param([IntPtr]$Handle)
+    if ($Handle -eq [IntPtr]::Zero) { return $false }
+    if (-not (Initialize-UiAutomation)) { return $false }
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+        if (-not $root) { return $false }
+        # Ctrl+K is swallowed when the chat composer owns keyboard focus. Moving
+        # focus to the document makes the app's global shortcut work again.
+        $docCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+            [System.Windows.Automation.ControlType]::Document)
+        $doc = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $docCond)
+        if ($doc) {
+            $doc.SetFocus()
+            return $true
+        }
+        $root.SetFocus()
+        return $true
+    } catch { return $false }
+}
+
+function Set-UiAppCommandFocus {
+    param([IntPtr]$Handle)
+    if ($Handle -eq [IntPtr]::Zero) { return $false }
+    if (-not (Initialize-UiAutomation)) { return $false }
+    try {
+        $root = [System.Windows.Automation.AutomationElement]::FromHandle($Handle)
+        if (-not $root) { return $false }
+        # Put keyboard focus on a normal button, not the document. A WebView
+        # document SetFocus can leave the chat composer owning the keyboard, in
+        # which case Ctrl+K is swallowed. Buttons inside the shell reliably take
+        # focus away from the composer.
+        foreach ($name in @('Session details', 'OpenCode menu', 'Home', 'New session')) {
+            $cond = New-Object System.Windows.Automation.PropertyCondition(
+                [System.Windows.Automation.AutomationElement]::NameProperty,
+                $name)
+            $el = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+            if (-not $el) { continue }
+            try {
+                $el.SetFocus()
+                Start-Sleep -Milliseconds 180
+                $fg = [System.Windows.Automation.AutomationElement]::FocusedElement
+                if ($fg -and $fg.Current.Name -eq $name -and
+                    $fg.Current.ControlType -ne [System.Windows.Automation.ControlType]::Edit) {
+                    return $true
+                }
+            } catch { }
+        }
+        return (Set-UiAppDocumentFocus -Handle $Handle)
+    } catch { return $false }
+}
+
+function Test-UiPaletteFocused {
+    param([object]$Palette)
+    if (-not $Palette) { return $false }
+    try {
+        $fg = [System.Windows.Automation.AutomationElement]::FocusedElement
+        if (-not $fg) { return $false }
+        if ($fg.Current.ControlType -ne [System.Windows.Automation.ControlType]::Edit) { return $false }
+        $a = $Palette.Current.BoundingRectangle
+        $b = $fg.Current.BoundingRectangle
+        if ($a.IsEmpty -or $b.IsEmpty) { return $false }
+        return ([Math]::Abs($a.X - $b.X) -lt 4 -and
+                [Math]::Abs($a.Y - $b.Y) -lt 4 -and
+                [Math]::Abs($a.Width - $b.Width) -lt 8 -and
+                [Math]::Abs($a.Height - $b.Height) -lt 8)
+    } catch { return $false }
+}
+
+function Open-SessionInDesktop {
+    param([string]$sessionID)
+    if (-not $sessionID) { return $false }
+    if (-not $Script:Cfg.OpenForkInDesktop) { return $false }
+    $sessionID = $sessionID.Trim()
+    if ($sessionID -notmatch '^ses_[A-Za-z0-9_\-]+$') {
+        Log ("refusing to open an invalid session id in the desktop: {0}" -f $sessionID)
+        return $false
+    }
+    if (-not (Initialize-DesktopWindowApi)) { return $false }
+    $proc = @(Get-OpenCodeDesktopProcess | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+    if (-not $proc.Count) {
+        Log ("opencode desktop is not running - cannot open fork {0}" -f $sessionID)
+        return $false
+    }
+    $p = $proc[0]
+    $h = [IntPtr]$p.MainWindowHandle
+    try {
+        Add-Type -AssemblyName System.Windows.Forms
+        # SW_RESTORE both shows and activates the window; SW_SHOW alone can leave
+        # keyboard focus on the previous child control.
+        [OcDesktopWin]::ShowWindow($h, 9) | Out-Null
+        $fg = [OcDesktopWin]::GetForegroundWindow()
+        $fgPid = 0
+        $fgThread = 0
+        if ($fg -ne [IntPtr]::Zero) {
+            $fgThread = [OcDesktopWin]::GetWindowThreadProcessId($fg, [ref]$fgPid)
+        }
+        $cur = [OcDesktopWin]::GetCurrentThreadId()
+        if ($fgThread -ne 0) { [OcDesktopWin]::AttachThreadInput($cur, $fgThread, $true) | Out-Null }
+        try {
+            [OcDesktopWin]::BringWindowToTop($h) | Out-Null
+            [OcDesktopWin]::SetForegroundWindow($h) | Out-Null
+        } finally {
+            if ($fgThread -ne 0) { [OcDesktopWin]::AttachThreadInput($cur, $fgThread, $false) | Out-Null }
+        }
+        Start-Sleep -Milliseconds 500
+        $fg2 = [OcDesktopWin]::GetForegroundWindow()
+        $fg2Pid = 0
+        if ($fg2 -ne [IntPtr]::Zero) { [OcDesktopWin]::GetWindowThreadProcessId($fg2, [ref]$fg2Pid) | Out-Null }
+        if ($fg2Pid -ne [int]$p.Id) {
+            # Foreground lock can reject the first attempt; one retry is enough.
+            [OcDesktopWin]::SetForegroundWindow($h) | Out-Null
+            Start-Sleep -Milliseconds 250
+            $fg3 = [OcDesktopWin]::GetForegroundWindow()
+            $fg3Pid = 0
+            if ($fg3 -ne [IntPtr]::Zero) { [OcDesktopWin]::GetWindowThreadProcessId($fg3, [ref]$fg3Pid) | Out-Null }
+            if ($fg3Pid -ne [int]$p.Id) {
+                Log ("could not focus the opencode desktop - not opening fork {0}" -f $sessionID)
+                return $false
+            }
+        }
+
+        # Find an already-open palette first. If we send Ctrl+K while it is open,
+        # the shortcut toggles it closed. UIA also lets us put keyboard focus
+        # directly into the search box instead of trusting the chat composer.
+        $palette = Get-UiPaletteEdit -Handle $h
+        if (-not [bool]$Script:UiaAvailable) {
+            Log ("UI Automation is unavailable - not opening fork {0} (no keys were typed into the composer)" -f $sessionID)
+            return $false
+        }
+        if (-not $palette) {
+            # Ctrl+K is swallowed when the chat composer has keyboard focus.
+            # Move focus to a shell button first, then open the palette.
+            Set-UiAppCommandFocus -Handle $h | Out-Null
+            Start-Sleep -Milliseconds 150
+            [System.Windows.Forms.SendKeys]::SendWait('^k')
+            $deadline = [Environment]::TickCount + 3500
+            while ([Environment]::TickCount -lt $deadline) {
+                Start-Sleep -Milliseconds 250
+                $palette = Get-UiPaletteEdit -Handle $h
+                if ($palette) { break }
+            }
+        }
+
+        if (-not $palette) {
+            # Ctrl+K is the primary binding; Ctrl+Shift+P is the alternate.
+            # Re-focus first because a successful focus may have been lost.
+            Set-UiAppCommandFocus -Handle $h | Out-Null
+            Start-Sleep -Milliseconds 150
+            [System.Windows.Forms.SendKeys]::SendWait('^+p')
+            $deadline = [Environment]::TickCount + 3000
+            while ([Environment]::TickCount -lt $deadline) {
+                Start-Sleep -Milliseconds 250
+                $palette = Get-UiPaletteEdit -Handle $h
+                if ($palette) { break }
+            }
+        }
+
+        if (-not $palette) {
+            Log ("opencode command palette did not appear - not opening fork {0} (no keys were typed into the composer)" -f $sessionID)
+            return $false
+        }
+        try { $palette.SetFocus() } catch {
+            Log ("could not focus the opencode palette search - not opening fork {0}" -f $sessionID)
+            return $false
+        }
+        Start-Sleep -Milliseconds 150
+        if (-not (Test-UiPaletteFocused -Palette $palette)) {
+            Log ("opencode palette did not take keyboard focus - not typing fork {0}" -f $sessionID)
+            return $false
+        }
+        [System.Windows.Forms.SendKeys]::SendWait($sessionID)
+        Start-Sleep -Milliseconds ([int]$Script:Cfg.OpenForkSearchDelayMs)
+        # UIA keeps the palette Edit focused after typing. If focus moved to
+        # the chat composer, Enter would send the id as a chat prompt, so
+        # verify again and refuse to press Enter.
+        if (-not (Test-UiPaletteFocused -Palette $palette)) {
+            Log ("opencode palette lost keyboard focus after typing - not pressing Enter for fork {0}" -f $sessionID)
+            return $false
+        }
+        [System.Windows.Forms.SendKeys]::SendWait('{ENTER}')
+        Start-Sleep -Milliseconds 500
+        Log ("opened fork {0} in the opencode desktop" -f $sessionID)
+        return $true
+    } catch {
+        Log ("could not open fork {0} in the desktop: {1}" -f $sessionID, $_.Exception.Message)
+        return $false
+    }
+}
+
+function Get-LiveSessionTitleSet {
+    $root = Invoke-OC '/api/session'
+    if ($null -eq $root -or -not $root.data) { return $null }
+    $set = @{}
+    foreach ($s in @($root.data)) {
+        $t = ''
+        try { $t = ([string]$s.title).Trim() } catch { }
+        if ($t) { $set[$t.ToLowerInvariant()] = $true }
+    }
+    return $set
+}
+
+function Get-DesktopTabNameVariants {
+    param([string]$Name)
+    if (-not $Name) { return @() }
+    $n = $Name.Trim()
+    if ($n -ceq 'Close tab') { return @() }
+    $n = ($n -creplace '\s+Close tab$', '').Trim()
+    if (-not $n) { return @() }
+    $variants = @($n)
+    # The tab strip prefixes some titles with a status marker (seen: "D " for
+    # a done/draft tab, "L " while loading). Compare both the raw name and the
+    # marker-free name. Keep the marker set narrow: stripping any leading
+    # single letter would misread a legitimate title such as "A fix ...".
+    $stripped = $n -creplace '^[DL]\s+', ''
+    if ($stripped -and $stripped -ne $n) { $variants += $stripped }
+    return $variants
+}
+
+function Close-DesktopSessionTab {
+    param([string]$Title, [hashtable]$LiveTitles)
+    if (-not $Title) { return $false }
+    if (-not (Initialize-UiAutomation)) { return $false }
+    $proc = @(Get-OpenCodeDesktopProcess | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+    if (-not $proc.Count) { return $false }
+    $title = $Title.Trim()
+    if (-not $title) { return $false }
+
+    $candidates = @($title)
+    if ($title -match '^\[burned\]\s*(.+)$') {
+        $candidates += $matches[1].Trim()
+    } else {
+        $candidates += ('[burned] ' + $title)
+    }
+    $candidates = @($candidates | Where-Object { $_ } | Select-Object -Unique)
+
+    # Never close a tab whose title still belongs to a live session. The
+    # burned source can be listed for a moment after deletion, and a different
+    # live session can legitimately reuse the same title.
+    if ($null -eq $LiveTitles) { $LiveTitles = Get-LiveSessionTitleSet }
+    if ($null -eq $LiveTitles) {
+        Log ("not closing desktop tab for {0}: cannot list live sessions to verify the title" -f $title)
+        return $false
+    }
+    foreach ($candidate in $candidates) {
+        if ($LiveTitles.ContainsKey($candidate.ToLowerInvariant())) {
+            Log ("not closing desktop tab for {0}: the title belongs to a live session" -f $candidate)
+            return $false
+        }
+    }
+
+    $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$proc[0].MainWindowHandle)
+    if (-not $root) { return $false }
+    try {
+        $closeCond = New-Object System.Windows.Automation.PropertyCondition(
+            [System.Windows.Automation.AutomationElement]::NameProperty,
+            'Close tab')
+        $buttons = $root.FindAll([System.Windows.Automation.TreeScope]::Descendants, $closeCond)
+        $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
+        for ($i = 0; $i -lt $buttons.Count; $i++) {
+            $button = $buttons.Item($i)
+            # Chat messages can contain the literal text "Close tab"; only the
+            # tab strip's close affordance is a Button whose parent is a tab
+            # Hyperlink. Requiring the tab-strip group class as well keeps a
+            # future chat link from being clicked.
+            if ($button.Current.ControlType -ne [System.Windows.Automation.ControlType]::Button) { continue }
+            $tab = $walker.GetParent($button)
+            if (-not $tab -or $tab.Current.ControlType -ne [System.Windows.Automation.ControlType]::Hyperlink) { continue }
+            $tabName = [string]$tab.Current.Name
+            if ($tabName -notmatch '\s+Close tab$') { continue }
+            $tabGroup = $walker.GetParent($tab)
+            if ($tabGroup) {
+                $groupClass = [string]$tabGroup.Current.ClassName
+                if ($groupClass -and
+                    $groupClass -notmatch 'bg-v2-background-bg-deep' -and
+                    $groupClass -notmatch 'shrink-0 relative flex flex-row h-9') { continue }
+            }
+            $tabVariants = @(Get-DesktopTabNameVariants -Name $tabName)
+            # Second guard at the tab level: if either the raw or the
+            # status-stripped tab title is a live session title, leave it alone.
+            $tabIsLive = $false
+            foreach ($tabVariant in $tabVariants) {
+                if ($tabVariant -and $LiveTitles.ContainsKey($tabVariant.ToLowerInvariant())) {
+                    $tabIsLive = $true
+                    break
+                }
+            }
+            if ($tabIsLive) { continue }
+            foreach ($tabVariant in $tabVariants) {
+                foreach ($candidate in $candidates) {
+                    if ($tabVariant -and $tabVariant -ieq $candidate) {
+                        try {
+                            $invoke = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+                            $invoke.Invoke()
+                            Log ("closed desktop tab for burned session {0}" -f $candidate)
+                            return $true
+                        } catch { }
+                    }
+                }
+            }
+        }
+    } catch { }
+    return $false
+}
+
+function Close-StaleBurnedTabs {
+    param([switch]$Quiet)
+    if (-not $Script:Cfg.SessionRemoveBurned -or -not $Script:Cfg.OpenForkInDesktop) { return 0 }
+    $proc = @(Get-OpenCodeDesktopProcess | Where-Object { $_.MainWindowHandle -ne 0 } | Select-Object -First 1)
+    if (-not $proc.Count) {
+        if (-not $Quiet) { Log 'stale-tab sweep skipped: opencode desktop is not running' }
+        return 0
+    }
+    if (-not (Initialize-UiAutomation)) {
+        if (-not $Quiet) { Log 'stale-tab sweep skipped: UI Automation is unavailable' }
+        return 0
+    }
+    $liveTitles = Get-LiveSessionTitleSet
+    if ($null -eq $liveTitles) {
+        if (-not $Quiet) { Log 'stale-tab sweep skipped: cannot list opencode sessions' }
+        return 0
+    }
+    if (-not $Script:State) { Load-State }
+    if (-not $Script:State -or -not $Script:State.sessions) { return 0 }
+
+    # A candidate is a title that could be on a dead tab: the exact pre-burn
+    # source title, the replacement fork title, and the fork title without its
+    # " (fork #N)" suffix. All live titles are filtered out before any UIA
+    # action, so a status prefix or a reused title cannot close the wrong tab.
+    $candidates = @{}
+    foreach ($p in @($Script:State.sessions.PSObject.Properties)) {
+        $rec = $p.Value
+        if (-not $rec) { continue }
+        $cleanup = ''
+        try { $cleanup = [string]$rec.cleanup } catch { }
+        if ($cleanup -ne 'deleted' -and $cleanup -ne 'gone') { continue }
+        $titles = @()
+        try { if ($rec.sourceTitle) { $titles += [string]$rec.sourceTitle } } catch { }
+        $forkTitle = ''
+        try { $forkTitle = [string]$rec.forkTitle } catch { }
+        if ($forkTitle) {
+            $titles += $forkTitle
+            $baseTitle = $forkTitle -replace '\s+\(fork #\d+\)$', ''
+            if ($baseTitle -and $baseTitle -ne $forkTitle) { $titles += $baseTitle }
+        }
+        foreach ($t in $titles) {
+            $t = ([string]$t).Trim()
+            $t = $t -replace '^\[burned\]\s*', ''
+            if (-not $t) { continue }
+            $key = $t.ToLowerInvariant()
+            # A live burned source is listed with its [burned] prefix. Check
+            # both forms so the periodic sweep skips it silently instead of
+            # asking the UIA closer to reject it every few minutes.
+            $isLive = $liveTitles.ContainsKey($key)
+            if (-not $isLive) {
+                $burnedKey = ('[burned] ' + $t).ToLowerInvariant()
+                $isLive = $liveTitles.ContainsKey($burnedKey)
+            }
+            if ($isLive) { continue }
+            if (-not $candidates.ContainsKey($key)) { $candidates[$key] = $t }
+        }
+    }
+
+    $closed = 0
+    foreach ($t in @($candidates.Values)) {
+        if (Close-DesktopSessionTab -Title $t -LiveTitles $liveTitles) { $closed++ }
+    }
+    if ($closed -gt 0) {
+        Log ("stale-tab sweep: closed {0} desktop tab(s) for deleted sessions" -f $closed)
+    } elseif (-not $Quiet) {
+        Log 'stale-tab sweep: no stale burned-session tabs found'
+    }
+    return $closed
+}
+
 function New-SessionFork {
     param(
         [string]$sessionID,
         [string]$reason = 'failover',
         [string]$kind = '',
         [string]$title = '',
+        [string]$Before = '',
         [switch]$IgnoreCap
     )
     if (-not $sessionID) { return $null }
@@ -2436,7 +3402,7 @@ function New-SessionFork {
         try { if ($rec.rootID) { $rootID = [string]$rec.rootID } } catch { }
     }
     if ((-not $IgnoreCap) -and ($depth -gt [int]$Script:Cfg.SessionForkMaxDepth)) {
-        Log ("session {0} reached the fork depth limit ({1}) - not forking again (use the session menu's fork option or -ForkSession to override the cap)" -f $sessionID, $Script:Cfg.SessionForkMaxDepth)
+        Log ("session {0} reached the fork depth limit ({1}) - not forking again (reset with -ResetForkCount or session menu R; F/-ForkSession override the cap once)" -f $sessionID, $Script:Cfg.SessionForkMaxDepth)
         return $null
     }
     if ((Get-ForkCountSince (Get-Date).AddHours(-1)) -ge [int]$Script:Cfg.SessionForkMaxPerHour) {
@@ -2444,24 +3410,61 @@ function New-SessionFork {
         return $null
     }
 
+    $beforeID = ''
+    if ($Before) {
+        $beforeID = ([string]$Before) -replace '[^A-Za-z0-9_\-]', ''
+        if ($beforeID -ne [string]$Before) {
+            Log ("ignoring invalid fork boundary '{0}' for session {1}" -f $Before, $sessionID)
+            $beforeID = ''
+        }
+    }
+    $attempts = @()
+    if ($beforeID) {
+        $attempts += [pscustomobject]@{ body = ('{\"before\":\"' + $beforeID + '\"}'); before = $beforeID }
+    }
+    $attempts += [pscustomobject]@{ body = '{}'; before = '' }
+
     Push-Location $Script:Cfg.ProjectDir
     try {
-        $out = & opencode api post ("/api/session/{0}/fork" -f $sessionID) --data '{}' 2>&1
-        if ($LASTEXITCODE -ne 0) {
-            $msg = (($out -join ' ') -replace '\s+', ' ')
-            if ($msg.Length -gt 160) { $msg = $msg.Substring(0, 160) }
-            Log ("session fork failed for {0}: {1}" -f $sessionID, $msg)
-            return $null
-        }
         $resp = $null
-        try { $resp = (($out -join "`n") | ConvertFrom-Json) } catch { }
         $forkID = $null
+        $usedBefore = ''
+        foreach ($attempt in $attempts) {
+            $out = & (Get-OpencodeCli) api post ("/api/session/{0}/fork" -f $sessionID) --data $attempt.body 2>&1
+            $exit = $LASTEXITCODE
+            $failMsg = ''
+            if ($exit -eq 0) {
+                try { $resp = (($out -join "`n") | ConvertFrom-Json) } catch { $resp = $null }
+                try { $forkID = [string]$resp.data.id } catch { $forkID = $null }
+                if ($forkID) {
+                    $usedBefore = [string]$attempt.before
+                    break
+                }
+                $failMsg = 'fork returned no id'
+            } else {
+                $failMsg = (($out -join ' ') -replace '\s+', ' ')
+                if ($failMsg.Length -gt 160) { $failMsg = $failMsg.Substring(0, 160) }
+            }
+            if ($attempt.before) {
+                Log ("session fork before {0} failed for {1}: {2} - retrying with the full transcript" -f $attempt.before, $sessionID, $failMsg)
+            } else {
+                Log ("session fork failed for {0}: {1}" -f $sessionID, $failMsg)
+                return $null
+            }
+        }
         $forkTitle = ''
-        try { $forkID = [string]$resp.data.id } catch { }
         try { $forkTitle = [string]$resp.data.title } catch { }
         if (-not $forkID) {
             Log ("session fork returned no id for {0}" -f $sessionID)
             return $null
+        }
+        # A fork of an already-burned source inherits the [burned] prefix; the
+        # replacement must be a normal, promptable session title.
+        if ($forkTitle -match '^\[burned\]\s*(.*)$') {
+            $cleanForkTitle = $Matches[1]
+            if ($cleanForkTitle) {
+                if (Set-SessionTitle $forkID $cleanForkTitle) { $forkTitle = $cleanForkTitle }
+            }
         }
 
         $now = Get-Date
@@ -2469,6 +3472,10 @@ function New-SessionFork {
             burnedAt  = $now.ToString('o')
             forkID    = $forkID
             forkTitle = $forkTitle
+            # Exact pre-burn title, used by the stale-tab sweep. Older records
+            # do not have this field; the sweep falls back to forkTitle.
+            sourceTitle = $title
+            forkBefore = $usedBefore
             reason    = $reason
             kind      = $kind
             depth     = $depth
@@ -2487,9 +3494,106 @@ function New-SessionFork {
         if ($title -and $title -notmatch '^\[burned\]') {
             Set-SessionTitle $sessionID ('[burned] ' + $title) | Out-Null
         }
-        Log ("session {0} burned by {1} errors - forked to {2} ({3}); the old session will not be prompted again" -f $sessionID, $kind, $forkID, $forkTitle)
+        $boundaryText = $(if ($usedBefore) { 'before ' + $usedBefore } else { 'full transcript' })
+        Log ("session {0} burned by {1} errors - forked to {2} ({3}; {4}); the old session will not be prompted again" -f $sessionID, $kind, $forkID, $forkTitle, $boundaryText)
         return $forkID
     } finally { Pop-Location }
+}
+
+function Remove-BurnedSource {
+    param([string]$sessionID, [string]$forkID)
+    if (-not $sessionID -or -not $forkID) { return $false }
+    if (-not $Script:Cfg.SessionRemoveBurned) { return $false }
+    if ($sessionID -eq $forkID) { return $false }
+    $rec = Get-SessionRec $sessionID
+    if (-not $rec) { return $false }
+    $cleanup = ''
+    try { $cleanup = [string]$rec.cleanup } catch { }
+    if ($cleanup -eq 'deleted' -or $cleanup -eq 'gone') { return $true }
+
+    # The fork must exist and must not be a parentID child of the source;
+    # deleting a parent cascades to child sessions. Fork links use the `fork`
+    # field, while subagents use parentID, so this guard keeps a future API
+    # change from taking the replacement down with the burned source.
+    $forkResp = Invoke-OC ("/api/session/{0}" -f $forkID)
+    if (-not $forkResp -or -not $forkResp.data -or -not $forkResp.data.id) {
+        Log ("refusing to remove burned source {0}: replacement fork {1} does not exist" -f $sessionID, $forkID)
+        return $false
+    }
+    $forkParent = ''
+    try { $forkParent = [string]$forkResp.data.parentID } catch { }
+    if ($forkParent) {
+        Log ("refusing to remove burned source {0}: fork {1} is a child session of another session" -f $sessionID, $forkID)
+        return $false
+    }
+    $forkSource = ''
+    try { $forkSource = [string]$forkResp.data.fork.sessionID } catch { }
+    if ($forkSource -and $forkSource -ne $sessionID) {
+        Log ("refusing to remove burned source {0}: fork {1} points at source {2}" -f $sessionID, $forkID, $forkSource)
+        return $false
+    }
+
+    # The source tab is usually still open. Remember its exact title so it can
+    # be closed after deletion instead of leaving a "session cannot be found"
+    # tab behind.
+    $srcTitle = ''
+    try {
+        $srcResp = Invoke-OC ("/api/session/{0}" -f $sessionID)
+        if ($srcResp -and $srcResp.data) { $srcTitle = [string]$srcResp.data.title }
+    } catch { }
+
+    $now = (Get-Date).ToString('o')
+    if (-not (Test-SessionExists $sessionID)) {
+        Add-Member -InputObject $rec -NotePropertyName cleanup -NotePropertyValue 'gone' -Force
+        Add-Member -InputObject $rec -NotePropertyName cleanupAt -NotePropertyValue $now -Force
+        Save-State
+        Log ("burned source {0} is already gone; kept the fork mapping to {1}" -f $sessionID, $forkID)
+        if ($srcTitle -and $Script:Cfg.OpenForkInDesktop) {
+            try { Close-DesktopSessionTab -Title $srcTitle | Out-Null } catch { }
+        }
+        return $true
+    }
+
+    $out = @()
+    $exit = -1
+    Push-Location $Script:Cfg.ProjectDir
+    try {
+        $out = & (Get-OpencodeCli) api delete ("/api/session/{0}" -f $sessionID) 2>&1
+        $exit = $LASTEXITCODE
+    } finally { Pop-Location }
+
+    if ($exit -eq 0) {
+        Add-Member -InputObject $rec -NotePropertyName cleanup -NotePropertyValue 'deleted' -Force
+        Add-Member -InputObject $rec -NotePropertyName cleanupAt -NotePropertyValue $now -Force
+        try { $rec.PSObject.Properties.Remove('cleanupError') } catch { }
+        Save-State
+        Log ("removed burned source {0} after fork {1} accepted the continue prompt" -f $sessionID, $forkID)
+        if ($srcTitle -and $Script:Cfg.OpenForkInDesktop) {
+            try { Close-DesktopSessionTab -Title $srcTitle | Out-Null } catch { }
+        }
+        return $true
+    }
+
+    if (-not (Test-SessionExists $sessionID)) {
+        Add-Member -InputObject $rec -NotePropertyName cleanup -NotePropertyValue 'gone' -Force
+        Add-Member -InputObject $rec -NotePropertyName cleanupAt -NotePropertyValue $now -Force
+        try { $rec.PSObject.Properties.Remove('cleanupError') } catch { }
+        Save-State
+        Log ("burned source {0} disappeared during cleanup; kept the fork mapping to {1}" -f $sessionID, $forkID)
+        if ($srcTitle -and $Script:Cfg.OpenForkInDesktop) {
+            try { Close-DesktopSessionTab -Title $srcTitle | Out-Null } catch { }
+        }
+        return $true
+    }
+
+    $msg = (($out -join ' ') -replace '\s+', ' ').Trim()
+    if ($msg.Length -gt 180) { $msg = $msg.Substring(0, 180) }
+    Add-Member -InputObject $rec -NotePropertyName cleanup -NotePropertyValue 'failed' -Force
+    Add-Member -InputObject $rec -NotePropertyName cleanupAt -NotePropertyValue $now -Force
+    Add-Member -InputObject $rec -NotePropertyName cleanupError -NotePropertyValue $msg -Force
+    Save-State
+    Log ("could not remove burned source {0} after fork {1}: {2}" -f $sessionID, $forkID, $msg)
+    return $false
 }
 
 function Resume-FailedSession {
@@ -2520,10 +3624,12 @@ function Resume-FailedSession {
 
     if ($target -eq $id -and -not $NoFork -and $Script:Cfg.SessionForkEnabled) {
         $forkID = $null
+        $beforeID = ''
+        try { $beforeID = [string]$Session.errMsgID } catch { }
         if ($ForceFork) {
-            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title) -IgnoreCap
+            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title) -Before $beforeID -IgnoreCap
         } else {
-            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title)
+            $forkID = New-SessionFork -sessionID $id -reason $Reason -kind ([string]$Session.kind) -title ([string]$Session.title) -Before $beforeID
         }
         if (-not $forkID) {
             Log ("not continuing {0}: session fork failed and the flagged session was not reused" -f $id)
@@ -2533,6 +3639,16 @@ function Resume-FailedSession {
     } elseif ($target -eq $id -and $NoFork -and (Test-SessionBurned $id)) {
         Log ("not prompting burned session {0} (no fork available)" -f $id)
         return $false
+    }
+
+    # Only clean up a source whose recorded replacement is the fork we are
+    # about to prompt. This keeps explicit -NoFork/other mappings safe.
+    $sourceToRemove = ''
+    if ($target -ne $id) {
+        $srcRec = Get-SessionRec $id
+        $recordedFork = ''
+        try { $recordedFork = [string]$srcRec.forkID } catch { }
+        if ($recordedFork -and $recordedFork -eq $target) { $sourceToRemove = $id }
     }
 
     # Do not repeat a continue for the same failure event.
@@ -2561,6 +3677,27 @@ function Resume-FailedSession {
         try { $n = [int]$tr.prompts } catch { }
         Add-Member -InputObject $tr -NotePropertyName prompts -NotePropertyValue ($n + 1) -Force
         Save-State
+        # The source is only removed after the fork accepted its continue
+        # prompt: a failed prompt leaves the burned source and mapping intact
+        # for the next resume attempt. Open the replacement first: deleting the
+        # active source switches the desktop to the "session cannot be found"
+        # screen, and the palette shortcut no longer opens reliably there.
+        # Only a replacement fork is a "new" view worth opening. A -NoFork
+        # endpoint retry (target is the source itself) must not steal focus.
+        $opened = $false
+        if ($target -ne $id -and $Script:Cfg.OpenForkInDesktop) {
+            $opened = [bool](Open-SessionInDesktop -sessionID $target)
+        }
+        if ($sourceToRemove) {
+            try {
+                Remove-BurnedSource -sessionID $sourceToRemove -forkID $target | Out-Null
+            } catch {
+                Log ("burned-source cleanup threw for {0}: {1}" -f $sourceToRemove, $_.Exception.Message)
+            }
+        }
+        if (-not $opened -and $target -ne $id) {
+            Log ("replacement fork {0} was not opened automatically; use the session menu O or -OpenSession {0}" -f $target)
+        }
         return $true
     }
     return $false
@@ -2667,15 +3804,28 @@ function Show-FailedSessionAction {
         $msg = ''
         try { $msg = (([string]$Session.msg) -replace '\s+', ' ').Trim() } catch { }
         if ($msg.Length -gt 300) { $msg = $msg.Substring(0, 297) + '...' }
+        $forkDepth = 0
+        $forkRec = Get-SessionRec ([string]$Session.id)
+        if ($forkRec) {
+            try {
+                if ($forkRec.PSObject.Properties['depth'] -and $null -ne $forkRec.depth) { $forkDepth = [int]$forkRec.depth }
+            } catch { }
+        }
+        $forkCap = [int]$Script:Cfg.SessionForkMaxDepth
+        $forkInfo = ('{0}/{1} forks used' -f $forkDepth, $forkCap)
+        if ($forkDepth -ge $forkCap) { $forkInfo += ' - auto-fork blocked (press R)' }
         Write-Host ''
         Write-Host 'Failed session'
         Write-Host '------------------------------------------------------------'
         Write-Host ('Title : {0}' -f $title)
         Write-Host ('ID    : {0}' -f $Session.id)
         Write-Host ('Kind  : {0}    Age: {1}' -f $kind, (Format-SessionAge $Session.errCreated))
+        Write-Host ('Fork  : {0}' -f $forkInfo)
         Write-Host ('Error : {0}' -f $msg)
         Write-Host ''
         Write-Host '[C] continue (fork + prompt)    [F] fork fresh (ignore cap)    [I] ignore forever'
+        Write-Host '[R] reset fork counter (allows automatic continue again)    [O] open in desktop'
+        Write-Host 'After a successful C/F the source is deleted and the fork opens in the desktop.'
         Write-Host '[B] back    [Q] quit'
         $a = Read-Host 'Action'
         if ($null -eq $a) { return 'quit' }
@@ -2710,6 +3860,28 @@ function Show-FailedSessionAction {
                 }
                 Read-Host 'Press Enter to return' | Out-Null
                 return 'back'
+            }
+            '^[Rr]$' {
+                Write-Host ''
+                Write-Host 'Resetting fork counter...'
+                if (Reset-SessionForkCount ([string]$Session.id)) {
+                    Write-Host 'Fork counter reset. Automatic recovery can fork this session again; the global hourly fork cap still applies.'
+                } else {
+                    Write-Host 'Nothing to reset - see failover.log for the reason.'
+                }
+                Read-Host 'Press Enter to return' | Out-Null
+                continue
+            }
+            '^[Oo]$' {
+                Write-Host ''
+                Write-Host 'Opening the session in the opencode desktop...'
+                if (Open-SessionInDesktop ([string]$Session.id)) {
+                    Write-Host 'Opened.'
+                } else {
+                    Write-Host 'Open failed - see failover.log for the reason.'
+                }
+                Read-Host 'Press Enter to return' | Out-Null
+                continue
             }
             '^[Ii]$' {
                 $confirm = Read-Host ('Ignore "{0}" forever? [y/N]' -f $title)
@@ -2858,14 +4030,22 @@ function Switch-HappServer {
     param(
         [pscustomobject]$Cur,
         [switch]$Fast,
-        [bool]$RestartDesktop = $false
+        [bool]$RestartDesktop = $false,
+        # Whether the desktop app was running before this failover started. Used
+        # after a service restart to distinguish "app died" from "user had no GUI".
+        [bool]$DesktopWasRunning = $false
     )
     $switched = $false
     $rotated = $false
     $appReady = $true
+    # Exit-check failures stay pending until a restore or a later switch proves
+    # the local tunnel works; only then do we know the failed target itself is bad.
+    $failedVerifyKeys = New-Object System.Collections.Generic.List[string]
+    Pump-BusyInput
     $cacheFiles = @(Get-ChildItem $Script:Cfg.ConfigCacheDir -Filter '*.json' -File -ErrorAction SilentlyContinue)
     if (-not $Fast -or $cacheFiles.Count -eq 0) {
         Update-ConfigCache | Out-Null
+        Pump-BusyInput
     }
     try {
         for ($attempt = 1; $attempt -le $Script:Cfg.MaxSwitchAttempts -and -not $switched; $attempt++) {
@@ -2923,12 +4103,44 @@ function Switch-HappServer {
             }
 
             foreach ($cand in $candidates) {
+                Pump-BusyInput
+                $Script:LastSwitchVerifyFailure = $null
+                $Script:LastSwitchReverted = $false
                 if (Invoke-PipeSwitch -Target $cand -Fast:$Fast) {
                     Mark-Used $cand
+                    # A verified switch proves the local path works, so earlier
+                    # exit-check failures cannot be blamed on a global outage.
+                    if ([bool]$Script:Cfg.AutoBanFailedSwitch -and $failedVerifyKeys.Count -gt 0) {
+                        foreach ($badKey in $failedVerifyKeys) {
+                            if (-not (Test-ServerBanned $badKey)) {
+                                Add-AutoBannedServer $badKey 'exit check failed before a later server verified' | Out-Null
+                            }
+                        }
+                        $failedVerifyKeys.Clear()
+                    }
                     $switched = $true
                     break
                 } else {
                     Mark-Used $cand
+                    $badKey = [string]$Script:LastSwitchVerifyFailure
+                    if ([bool]$Script:Cfg.AutoBanFailedSwitch -and $badKey) {
+                        if ($Script:LastSwitchReverted) {
+                            # The original config just verified, so the target was
+                            # the broken part. Ban it and any earlier unproven ones.
+                            if ($failedVerifyKeys.Contains($badKey)) { $failedVerifyKeys.Remove($badKey) | Out-Null }
+                            if (-not (Test-ServerBanned $badKey)) {
+                                Add-AutoBannedServer $badKey 'exit check failed; original server restored' | Out-Null
+                            }
+                            foreach ($pendingKey in @($failedVerifyKeys)) {
+                                if (-not (Test-ServerBanned $pendingKey)) {
+                                    Add-AutoBannedServer $pendingKey 'exit check failed before a verified revert' | Out-Null
+                                }
+                            }
+                            $failedVerifyKeys.Clear()
+                        } elseif (-not $failedVerifyKeys.Contains($badKey)) {
+                            $failedVerifyKeys.Add($badKey)
+                        }
+                    }
                 }
             }
         }
@@ -2941,11 +4153,11 @@ function Switch-HappServer {
                         $appReady = Start-OpencodeDesktop
                     } else {
                         # no desktop process was stopped for this round (CLI-only usage)
-                        $appReady = Restart-OpencodeService
+                        $appReady = Restart-OpencodeService -DesktopWasRunning:$false
                     }
                 } else {
                     # default: keep the desktop app running, reload only the background service
-                    $appReady = Restart-OpencodeService
+                    $appReady = Restart-OpencodeService -DesktopWasRunning:$DesktopWasRunning
                 }
             } catch {
                 Log ("opencode restart failed: " + $_.Exception.Message)
@@ -2958,6 +4170,16 @@ function Switch-HappServer {
 
 function Invoke-Failover {
     param([string]$Reason = 'auto', [switch]$Fast)
+    $Script:FailoverDepth = [int]$Script:FailoverDepth + 1
+    if ($Script:FailoverDepth -eq 1) {
+        $Script:IgnoredBusyKeys = 0
+        $Script:BusyIgnoreLogged = $false
+        # A [T]/[B] press can leave extra keys queued. Do not let them fire
+        # after the switch (e.g. a second ban aimed at the old current server).
+        $stale = Clear-ConsoleInput
+        if ($stale -gt 0) { Log ("discarded {0} stale keypress(es) queued before failover" -f $stale) }
+    }
+    try {
     Load-State
     $global:LastFailover = Get-Date
     # A new server generation starts with no endpoint soft-retry state.
@@ -2969,10 +4191,12 @@ function Invoke-Failover {
     $cur = Get-ActiveServer
     if ($cur) {
         # The per-IP free usage limit ("Free usage limit reached. Subscribe to
-        # OpenCode Go...") belongs to the exit IP, not the server: a quota
-        # failover switches to a fresh IP but must never ban the server. Only a
-        # rate-limit error arriving immediately after one of our continue
-        # prompts (Reason 'rate-instant') counts as evidence against the server.
+        # OpenCode Go...") belongs to the exit IP, not the current server: a
+        # quota failover switches to a fresh IP but does not ban the current
+        # server. The canary gate separately tests and bans a freshly selected
+        # target that insta-hits. Only a rate-limit error arriving immediately
+        # after one of our continue prompts (Reason 'rate-instant') bans the
+        # current server here.
         if ($Reason -eq 'rate-instant') {
             Add-AutoBannedServer (Get-ServerKey $cur) 'rate limit right after continue' | Out-Null
         } elseif ($Reason -eq 'timeout-instant') {
@@ -2991,7 +4215,9 @@ function Invoke-Failover {
         $affected = @()
         Log 'fast failover: deferring affected-session scan until after the switch'
     } else {
+        Pump-BusyInput
         $affected = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+        Pump-BusyInput
         $affectedIds = (($affected | ForEach-Object { $_.id }) -join ', ')
         if (-not $affectedIds) { $affectedIds = 'none' }
         Log ("affected sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $affectedIds)
@@ -2999,11 +4225,15 @@ function Invoke-Failover {
 
     # The canary gate: when rate-kind sessions are affected, a brand-new
     # session must prove the freshly selected server clean before any fork is
-    # made. A canary that insta-hits the rate limit incriminates its server -
-    # auto-ban it and fail over to the next candidate. Forks and continue
-    # prompts only run on servers whose canary came out ok (or when no
-    # rate-kind work is affected). The post-reload scan decides the gate in
-    # Fast mode too, so it moved inside this loop.
+    # made. A canary that insta-hits a rate limit or the free-usage quota
+    # incriminates its server/exit IP - auto-ban it and fail over to the next
+    # candidate. With RateCanaryMaxAttempts=0 (default) there is no round
+    # cap: keep switching until a clean server is found or no candidate is
+    # left. A canary blocked by a provider-account credit error stops the
+    # failover without bans. Forks and continue prompts only run on servers
+    # whose canary came out ok (or when no rate-kind work is affected). The
+    # post-reload scan decides the gate in Fast mode too, so it moved inside
+    # this loop.
     $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
     for ($round = 1; ; $round++) {
         if ($round -gt 1) {
@@ -3019,7 +4249,7 @@ function Invoke-Failover {
                 return
             }
         }
-        $sw = Switch-HappServer -Cur $cur -Fast:$Fast -RestartDesktop:$stopDesktop
+        $sw = Switch-HappServer -Cur $cur -Fast:$Fast -RestartDesktop:$stopDesktop -DesktopWasRunning:$desktopWasRunning
         if (-not $sw.switched) {
             if ($round -gt 1) {
                 Log 'canary retry could not switch to another server - skipping the fork/continue phase (affected sessions stay flagged for the next scan)'
@@ -3037,11 +4267,13 @@ function Invoke-Failover {
         if ($Fast -and $settleSec -gt 1) { $settleSec = 1 }
         if ($settleSec -gt 0) {
             Log ("waiting {0}s for the provider to settle before continue prompts..." -f $settleSec)
-            Start-Sleep -Seconds $settleSec
+            Wait-BusySlice ($settleSec * 1000)
         }
 
         # Post-reload failed scan: feeds both the prompt phase and the gate.
+        Pump-BusyInput
         $postReload = Get-FailedSessions -windowMinutes $Script:Cfg.SessionResumeFreshMin -freshMinutes $Script:Cfg.SessionResumeFreshMin -kinds @('rate','endpoint','connreset','timeout')
+        Pump-BusyInput
         $postIds = (($postReload | ForEach-Object { $_.id }) -join ', ')
         if (-not $postIds) { $postIds = 'none' }
         Log ("post-reload failed sessions (fresh {0} min): {1}" -f $Script:Cfg.SessionResumeFreshMin, $postIds)
@@ -3052,7 +4284,31 @@ function Invoke-Failover {
             break
         }
 
-        $canary = Test-RateCanary -context ('failover ' + $Reason + (' round {0}' -f $round))
+        Pump-BusyInput
+        $canary = $null
+        try {
+            $canary = Test-RateCanary -context ('failover ' + $Reason + (' round {0}' -f $round))
+        } finally {
+            # The probe may have timed out while the model was still running.
+            # Stop it before evaluating the verdict so it cannot keep using tools
+            # after this failover has moved on.
+            $canarySid = ''
+            try { $canarySid = [string]$Script:LastCanarySessionID } catch { }
+            if ($canarySid) {
+                Stop-RateCanarySession $canarySid | Out-Null
+                $Script:LastCanarySessionID = $null
+            }
+        }
+        Pump-BusyInput
+        if ($canary -and ([string]$canary.verdict -in @('credits','wrong-model'))) {
+            # A provider-account credit error or a probe that ran on the wrong
+            # model (stale default-model config in opencode.json) cannot be
+            # fixed by bans or further switches: the fork/continue phase is
+            # skipped, nothing is banned, and sessions stay flagged until the
+            # config/credits are fixed and the next scan retries.
+            Log ("canary {0} ({1} round {2}) - skipping the fork/continue phase (nothing banned)" -f $canary.verdict.ToUpperInvariant(), $Reason, $round)
+            return
+        }
         if ($canary -and ([string]$canary.verdict -eq 'hit')) {
             # An instant rate limit in a brand-new session: the server or its
             # exit IP is throttled right now - never fork onto it. Ban it and
@@ -3066,8 +4322,9 @@ function Invoke-Failover {
             } else {
                 Log ("canary HIT ({0} round {1}) - cannot read the active server to ban" -f $Reason, $round)
             }
-            if ($round -ge [Math]::Max(1, [int]$Script:Cfg.RateCanaryMaxAttempts)) {
-                Log ("canary kept hitting the rate limit after {0} round(s) - skipping the fork/continue phase (affected sessions stay flagged for the next scan)" -f $round)
+            $maxCanaryRounds = [int]$Script:Cfg.RateCanaryMaxAttempts
+            if ($maxCanaryRounds -gt 0 -and $round -ge $maxCanaryRounds) {
+                Log ("canary reached the configured {0}-round cap - skipping the fork/continue phase (affected sessions stay flagged for the next scan)" -f $maxCanaryRounds)
                 return
             }
             continue
@@ -3095,12 +4352,24 @@ function Invoke-Failover {
                     if (-not $fresh) { continue }
                 }
             }
+            Pump-BusyInput
             Resume-FailedSession -Session $s -Reason $Reason | Out-Null
+            Pump-BusyInput
         }
     } finally {
         $global:FailoverPromptEnd = Get-Date
     }
     Log 'failover complete'
+    } finally {
+        if ($Script:FailoverDepth -eq 1) {
+            # Give an [L] pressed during the last blocking call one chance, then
+            # drop anything else so the outer dashboard loop cannot replay it.
+            Pump-BusyInput
+            $stale = Clear-ConsoleInput
+            if ($stale -gt 0) { Log ("discarded {0} keypress(es) queued during failover" -f $stale) }
+        }
+        $Script:FailoverDepth = [Math]::Max(0, [int]$Script:FailoverDepth - 1)
+    }
 }
 
 # ------------------------------------------------------------------- log tail
@@ -3115,6 +4384,24 @@ function Test-OpLogTail {
             try { $ts = [DateTime]::Parse($Matches[1]).ToLocalTime() } catch { }
         }
         if (-not $ts) { continue }
+        # Only a real provider/AI error line may trigger a failover. OpenCode
+        # logs every spawned command at INFO with its full args; a diagnostic
+        # or tool command that merely mentions a rate-limit phrase must not
+        # count as a provider error. Anchor on the line's own level field and
+        # require the AI error cause (the session/error line format).
+        if ($l -notmatch '^timestamp=\S+\s+level=ERROR\s+.*\bcause="AI\.Error(?:\.QuotaExceeded)?:') { continue }
+        # The watchdog's own probe sessions (rate canary) and already-burned
+        # sources write the same rate/quota lines to the global log. Reacting
+        # to those lines causes a second, false failover seconds after the
+        # canary already decided to skip the fork phase. Ignore any log line
+        # whose sessionID is suppressed (ignored or burned).
+        $sid = ''
+        if ($l -match 'sessionID=(ses_[A-Za-z0-9]+)') { $sid = $Matches[1] }
+        if ($sid) {
+            $suppressed = $false
+            try { $suppressed = [bool](Test-SessionSuppressed $sid) } catch { }
+            if ($suppressed) { continue }
+        }
         if ($l -match $Script:Cfg.RateLimitPattern) {
             if ($ts -gt $rateNewest) { $rateNewest = $ts }
             if ($l -match $Script:Cfg.QuotaBanPattern -and $ts -gt $quotaNewest) { $quotaNewest = $ts }
@@ -3131,18 +4418,20 @@ function Test-OpLogTail {
 # state.connResetUntil / state.timeoutUntil, or the in-memory EndpointSeenAt
 # watermark, were already processed.
 function Test-SessionFailureScan {
+    param([int]$ConnResetWindowSec = 0)
     $result = [pscustomobject]@{ connReset = 0; timeouts = @(); endpoints = @() }
     $root = Invoke-OC '/api/session'
     if ($null -eq $root -or -not $root.data) { return $result }
+    if ($ConnResetWindowSec -le 0) { $ConnResetWindowSec = [int]$Script:Cfg.ConnResetWindowSec }
     $nowMs = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
-    $winMs = $Script:Cfg.ConnResetWindowSec * 1000
+    $winMs = $ConnResetWindowSec * 1000
     $floorMs = $nowMs - $winMs
     $processedMs = 0
     try { $processedMs = [int64][string]$Script:State.connResetUntil } catch { $processedMs = 0 }
     $toProcessedMs = 0
     try { $toProcessedMs = [int64][string]$Script:State.timeoutUntil } catch { $toProcessedMs = 0 }
     # sessions untouched for longer than this cannot contain a fresh failure
-    $updFloorMs = $nowMs - ([Math]::Max([int]$Script:Cfg.ConnResetWindowSec, 600) * 1000)
+    $updFloorMs = $nowMs - ([Math]::Max($ConnResetWindowSec, 600) * 1000)
     $count = 0
     $timeouts = @{}
     $endpoints = @{}
@@ -3188,6 +4477,153 @@ function Test-SessionFailureScan {
     $result.timeouts = @($timeouts.Values | Sort-Object created)
     $result.endpoints = @($endpoints.Values | Sort-Object created)
     return $result
+}
+
+# On the first connection-loss event after launch, keep the current server and
+# send one same-server continue. The event often predates launch: closing the
+# watchdog released the tunnel, and the active session recorded ECONNRESET while
+# the VPN reconnected. Return true when the grace was consumed (whether or not a
+# session was found) so the caller does not also switch this tick.
+function Invoke-StartupConnResetRetry {
+    param([int]$FailureCount = 0)
+    if (-not $Script:StartupConnResetGracePending) { return $false }
+    if ((Get-Date) -gt $Script:StartupConnResetGraceUntil) {
+        $Script:StartupConnResetGracePending = $false
+        Log ("startup connreset grace expired after {0}s - normal connreset rules apply" -f [int]$Script:Cfg.StartupConnResetGraceSec)
+        return $false
+    }
+    if ($FailureCount -lt 1) { return $false }
+    $cur = Get-ActiveServer
+    if (-not $cur) {
+        $Script:StartupConnResetGracePending = $false
+        Log 'startup connreset grace skipped: cannot read the current server'
+        return $false
+    }
+    $key = Get-ServerKey $cur
+    if ($key -and (Test-ServerBanned $key)) {
+        $Script:StartupConnResetGracePending = $false
+        Log ('startup connreset grace skipped: current server ' + $key + ' is banned')
+        return $false
+    }
+    # Do not spend the one retry while the tunnel is still reconnecting. The
+    # main loop's health tick runs right after this scan and can restore the
+    # TUN; keep the grace armed and let the next scan try again. A server switch
+    # in the meantime cancels the grace (checked by the caller).
+    try { $probeIp = Test-ProxyExit -tries 1 -TimeoutSec 4 } catch { $probeIp = '' }
+    if (-not $probeIp) {
+        Log 'startup ECONNRESET grace: tunnel not ready - deferring the same-server retry'
+        return $true
+    }
+    $Script:StartupConnResetGracePending = $false
+    # Consume the failures that triggered this attempt before sending the
+    # continue. A new failure written during/after the retry is newer than this
+    # watermark and follows the normal connreset rules.
+    $until = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+    Add-Member -InputObject $Script:State -NotePropertyName connResetUntil -NotePropertyValue ([string]$until) -Force
+    Save-State
+    $label = Format-ServerLabel $cur
+    Log ("startup ECONNRESET grace: {0} failure(s) - keeping {1} and retrying once" -f $FailureCount, $label)
+    $lookback = [Math]::Max(1, [int]$Script:Cfg.StartupConnResetLookbackMin)
+    $graceSessions = @()
+    Pump-BusyInput
+    try {
+        $graceSessions = @(Get-FailedSessions -windowMinutes $lookback -freshMinutes $lookback -kinds @('connreset'))
+    } catch {
+        Log ("startup ECONNRESET grace scan failed: {0}" -f $_.Exception.Message)
+    }
+    Pump-BusyInput
+    $resumed = 0
+    foreach ($s in $graceSessions) {
+        if (-not $s -or -not $s.id) { continue }
+        Log ("startup ECONNRESET grace: continuing {0} on current server (no fork)" -f $s.id)
+        if (Resume-FailedSession -Session $s -Reason 'startup-connreset-grace' -NoFork) { $resumed++ }
+    }
+    if ($resumed -eq 0) {
+        if ($graceSessions.Count -eq 0) {
+            Log 'startup ECONNRESET grace: no resumable session found - keeping the current server for this pass'
+        } else {
+            Log 'startup ECONNRESET grace: no session needed a continue (already prompted or moved on)'
+        }
+    } else {
+        Log ("startup ECONNRESET grace: sent {0} same-server continue(s); switching is deferred until a fresh failure" -f $resumed)
+    }
+    return $true
+}
+
+# The startup grace also covers a dead system route: closing the previous
+# watchdog released the owned core/TUN, so the current server may still be fine
+# even though the route is down. Restart that same server once before rotating.
+# A real server switch cancels the retry. Returns true only when the current
+# server verified and the caller must not switch.
+function Invoke-StartupTunnelRetry {
+    if (-not $Script:StartupTunnelRetryPending) { return $false }
+    if ((Get-Date) -gt $Script:StartupConnResetGraceUntil) {
+        $Script:StartupTunnelRetryPending = $false
+        Log ("startup tunnel grace expired after {0}s - normal tunnel rules apply" -f [int]$Script:Cfg.StartupConnResetGraceSec)
+        return $false
+    }
+    if ($Script:StartupConnResetArmedAt -and $global:LastSwitchAt -and
+        $global:LastSwitchAt -gt $Script:StartupConnResetArmedAt) {
+        $Script:StartupTunnelRetryPending = $false
+        Log 'startup tunnel grace cancelled: a server switch has happened since launch'
+        return $false
+    }
+    $cur = Get-ActiveServer
+    if (-not $cur) {
+        $Script:StartupTunnelRetryPending = $false
+        Log 'startup tunnel grace skipped: cannot read the current server'
+        return $false
+    }
+    $key = Get-ServerKey $cur
+    if ($key -and (Test-ServerBanned $key)) {
+        $Script:StartupTunnelRetryPending = $false
+        Log ('startup tunnel grace skipped: current server ' + $key + ' is banned')
+        return $false
+    }
+    $Script:StartupTunnelRetryPending = $false
+    $label = Format-ServerLabel $cur
+    Log ("startup tunnel grace: route dead - restarting {0} once before switching" -f $label)
+    $ok = $false
+    try {
+        $ok = [bool](Invoke-PipeSwitch -Target $cur -Fast -SameServer)
+    } catch {
+        Log ("startup tunnel grace restart failed: {0}" -f $_.Exception.Message)
+    }
+    if ($ok) {
+        # Invoke-PipeSwitch's fast verification only proves the socks listener.
+        # This retry was triggered by a dead system route, so require the route
+        # apps actually use to recover before keeping the current server.
+        $th = Get-TunnelHealth
+        if (-not $th.plainOk) {
+            Wait-BusySlice 2000
+            $th = Get-TunnelHealth
+        }
+        if ($th.plainOk) {
+            Log ("startup tunnel grace: {0} is reachable (system route up) - keeping it" -f $label)
+            # Invoke-PipeSwitch bypasses Switch-HappServer, so it does not reload
+            # the OpenCode service. The old provider connections were bound to the
+            # core/TUN we just replaced; without this refresh the first message
+            # after launch can still hit ECONNRESET on a half-open connection.
+            if ($Script:Cfg.RestartOpenCode) {
+                $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
+                Log 'startup tunnel grace: reloading the opencode background service to refresh provider connections'
+                $svcOk = $false
+                try {
+                    $svcOk = [bool](Restart-OpencodeService -DesktopWasRunning:$desktopWasRunning)
+                } catch {
+                    Log ("startup tunnel grace: opencode service reload failed: {0}" -f $_.Exception.Message)
+                }
+                if (-not $svcOk) {
+                    Log 'startup tunnel grace: opencode service did not confirm healthy - keeping the current server anyway'
+                }
+            }
+            return $true
+        }
+        Log ("startup tunnel grace: {0} socks is up but the system route is still dead - normal switching resumes" -f $label)
+        return $false
+    }
+    Log ("startup tunnel grace: {0} still unreachable - normal switching resumes" -f $label)
+    return $false
 }
 
 # A failure is "instant" when it arrives shortly after a continue prompt sent
@@ -3268,6 +4704,109 @@ function Get-TunnelHealth {
     return $r
 }
 
+# Manual [N]: operator-triggered version of the startup tunnel grace. Restart
+# the current server without switching, refresh the OpenCode service, then
+# continue recent connection-loss sessions in place (no fork). Never bans or
+# marks the server used; a failed reconnect leaves the current server as-is.
+function Invoke-ManualReconnect {
+    $null = Clear-ConsoleInput
+    try {
+        $cur = Get-ActiveServer
+        if (-not $cur) {
+            Log 'manual reconnect [N] skipped: cannot read the current server'
+            return $false
+        }
+        $key = Get-ServerKey $cur
+        if ($key -and (Test-ServerBanned $key)) {
+            Log ('manual reconnect [N] skipped: current server ' + $key + ' is banned - press T to switch')
+            return $false
+        }
+        $label = Format-ServerLabel $cur
+        Log ("manual reconnect [N]: restarting current server {0} once" -f $label)
+        $ok = $false
+        try {
+            $ok = [bool](Invoke-PipeSwitch -Target $cur -Fast -SameServer)
+        } catch {
+            Log ("manual reconnect [N]: restart failed: {0}" -f $_.Exception.Message)
+        }
+        if (-not $ok) {
+            Log ("manual reconnect [N]: {0} did not verify - press T to switch" -f $label)
+            return $false
+        }
+        $th = Get-TunnelHealth
+        if (-not $th.plainOk) {
+            Wait-BusySlice 2000
+            $th = Get-TunnelHealth
+        }
+        if (-not $th.plainOk) {
+            Log ("manual reconnect [N]: {0} socks is up but the system route is still dead - press N to retry or T to switch" -f $label)
+            return $false
+        }
+        Log ("manual reconnect [N]: {0} is reachable (system route up) - keeping it" -f $label)
+        $Script:StartupTunnelRetryPending = $false
+        $Script:DeadStreak = 0
+        $Script:AdapterStreak = 0
+
+        if ($Script:Cfg.RestartOpenCode) {
+            $desktopWasRunning = @(Get-OpenCodeDesktopProcess).Count -gt 0
+            Log 'manual reconnect [N]: reloading the opencode background service to refresh provider connections'
+            $svcOk = $false
+            try {
+                $svcOk = [bool](Restart-OpencodeService -DesktopWasRunning:$desktopWasRunning)
+            } catch {
+                Log ("manual reconnect [N]: opencode service reload failed: {0}" -f $_.Exception.Message)
+            }
+            if (-not $svcOk) {
+                Log 'manual reconnect [N]: opencode service did not confirm healthy - skipping the session revive'
+                return $false
+            }
+        }
+
+        # Consume the connection-loss failures that existed before this
+        # reconnect; the next normal scan must not immediately switch because of
+        # them. New failures are newer than the watermark and follow normal rules.
+        $until = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+        Add-Member -InputObject $Script:State -NotePropertyName connResetUntil -NotePropertyValue ([string]$until) -Force
+        Add-Member -InputObject $Script:State -NotePropertyName timeoutUntil -NotePropertyValue ([string]$until) -Force
+        Save-State
+
+        $lookback = [Math]::Max(1, [int]$Script:Cfg.AffectedWindowMin)
+        $revive = @()
+        $scanFailed = $false
+        Pump-BusyInput
+        try {
+            $revive = @(Get-FailedSessions -windowMinutes $lookback -kinds @('connreset','timeout'))
+        } catch {
+            $scanFailed = $true
+            Log ("manual reconnect [N]: failed-session scan failed: {0}" -f $_.Exception.Message)
+        }
+        Pump-BusyInput
+        $resumed = 0
+        foreach ($s in $revive) {
+            if (-not $s -or -not $s.id) { continue }
+            Log ("manual reconnect [N]: continuing {0} on the current server (no fork)" -f $s.id)
+            if (Resume-FailedSession -Session $s -Reason 'manual-reconnect' -NoFork) { $resumed++ }
+        }
+        if ($resumed -eq 0) {
+            if ($scanFailed) {
+                Log 'manual reconnect [N]: tunnel and service are up; session scan failed'
+            } elseif ($revive.Count -eq 0) {
+                Log 'manual reconnect [N]: tunnel and service are up; no connection-loss sessions to revive'
+            } else {
+                Log 'manual reconnect [N]: tunnel and service are up; no session needed a continue (already prompted or moved on)'
+            }
+        } else {
+            Log ("manual reconnect [N]: tunnel and service are up; revived {0} session(s)" -f $resumed)
+        }
+        return $true
+    } catch {
+        Log ("manual reconnect [N] failed: {0}" -f $_.Exception.Message)
+        return $false
+    } finally {
+        $null = Clear-ConsoleInput
+    }
+}
+
 # ---------------- endpoint-unavailable soft-retry (tier 1: same server) --------------
 function New-SoftState {
     return [pscustomobject]@{
@@ -3285,6 +4824,7 @@ $Script:Soft = New-SoftState
 $Script:EndpointSeenAt = [datetime]::MinValue
 $Script:ConnResetLast = $null
 $Script:TunnelLast = $null
+$Script:StaleTabLast = $null
 $Script:DeadStreak = 0
 $Script:AdapterStreak = 0
 $Script:SawTunAlive = $false
@@ -3367,7 +4907,7 @@ function Handle-Endpoint {
 }
 
 # ------------------------------------------------------------------- test modes
-if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $ListIgnored) {
+if ($ForkSession -or $OpenSession -or $UnburnSession -or $CleanupBurnedSession -or $ResetForkCount -or $ListBurned -or $CloseStaleTabs -or $UnignoreSession -or $ListIgnored) {
     Load-State
     if ($ListBurned) {
         $burned = @($Script:State.sessions.PSObject.Properties | Where-Object {
@@ -3380,9 +4920,21 @@ if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $Li
                 $v = $e.Value
                 $kind = ''
                 try { $kind = [string]$v.kind } catch { }
-                Log ("burned session: {0} -> fork {1} ({2}) at {3}" -f $e.Name, $v.forkID, $kind, $v.burnedAt)
+                $cleanup = ''
+                try { $cleanup = [string]$v.cleanup } catch { }
+                $sourceState = 'source kept'
+                if ($cleanup -eq 'deleted') { $sourceState = 'source deleted' }
+                elseif ($cleanup -eq 'gone') { $sourceState = 'source already gone' }
+                elseif ($cleanup -eq 'failed') { $sourceState = 'source kept, cleanup failed' }
+                $before = ''
+                try { $before = [string]$v.forkBefore } catch { }
+                $boundary = $(if ($before) { 'before ' + $before } else { 'full transcript' })
+                Log ("burned session: {0} -> fork {1} ({2}) at {3}; {4}; {5}" -f $e.Name, $v.forkID, $kind, $v.burnedAt, $boundary, $sourceState)
             }
         }
+    }
+    if ($CloseStaleTabs) {
+        Close-StaleBurnedTabs | Out-Null
     }
     if ($ListIgnored) {
         $ignored = @($Script:State.sessions.PSObject.Properties | Where-Object {
@@ -3408,6 +4960,18 @@ if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $Li
             }
         }
     }
+    if ($OpenSession) {
+        $oKey = $OpenSession.Trim()
+        if (-not $oKey) {
+            Log 'no session id given for -OpenSession'
+        } elseif (-not (Test-SessionExists $oKey)) {
+            Log ("session not found: " + $oKey)
+        } else {
+            if (-not (Open-SessionInDesktop -sessionID $oKey)) {
+                Log ("open request failed for {0} - the session remains available by id" -f $oKey)
+            }
+        }
+    }
     if ($UnburnSession) {
         $uKey = $UnburnSession.Trim()
         $up = $Script:State.sessions.PSObject.Properties[$uKey]
@@ -3421,11 +4985,77 @@ if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $Li
             if ($uIgnored -and -not $uFork) {
                 Log ("session {0} is ignored, not burned - use -UnignoreSession" -f $uKey)
             } else {
+                $uTitle = ''
+                $uExists = Test-SessionExists $uKey
+                if ($uExists) {
+                    $uResp = Invoke-OC ("/api/session/{0}" -f $uKey)
+                    if ($uResp -and $uResp.data) { try { $uTitle = [string]$uResp.data.title } catch { } }
+                    if ($uTitle -match '^\[burned\]\s*(.*)$') {
+                        $restoreTitle = $Matches[1]
+                        if (-not $restoreTitle) { $restoreTitle = $uKey }
+                        if (-not (Set-SessionTitle $uKey $restoreTitle)) {
+                            Log ("warning: could not restore the title of {0}; it still starts with [burned]" -f $uKey)
+                        }
+                    }
+                }
                 $Script:State.sessions.PSObject.Properties.Remove($uKey) | Out-Null
                 if ($uFork) { $Script:State.sessions.PSObject.Properties.Remove($uFork) | Out-Null }
                 Save-State
-                Log ("unburned session " + $uKey + " - it can be scanned and prompted again")
+                if ($uExists) {
+                    Log ("unburned session {0} - title restored, it can be scanned and prompted again" -f $uKey)
+                } else {
+                    Log ("cleared burn mapping for {0}: the source was removed after its fork; fork {1} remains live" -f $uKey, $uFork)
+                }
             }
+        }
+    }
+    if ($CleanupBurnedSession) {
+        $cKey = $CleanupBurnedSession.Trim()
+        if (-not $cKey) {
+            Log 'no session id given for -CleanupBurnedSession'
+        } else {
+            $cRec = Get-SessionRec $cKey
+            if (-not $cRec) {
+                Log ("no burn record for " + $cKey)
+            } else {
+                $cFork = ''
+                try { $cFork = [string]$cRec.forkID } catch { }
+                $cCleanup = ''
+                try { $cCleanup = [string]$cRec.cleanup } catch { }
+                if (-not $cFork) {
+                    Log ("session {0} has no recorded fork - not a burned source" -f $cKey)
+                } elseif ($cCleanup -eq 'deleted' -or $cCleanup -eq 'gone') {
+                    Log ("burned source {0} was already cleaned up ({1})" -f $cKey, $cCleanup)
+                } else {
+                    # Manual repair path. The automatic cleanup only runs after
+                    # the fork accepted its continue prompt; keep that invariant
+                    # here so a pre-prompt invocation cannot delete the source.
+                    $cPrompted = $false
+                    try {
+                        $cp = $Script:State.prompted.PSObject.Properties[$cFork]
+                        if ($cp -and $cp.Value) { $cPrompted = $true }
+                    } catch { }
+                    if (-not $cPrompted) {
+                        $cForkRec = Get-SessionRec $cFork
+                        try { if ($cForkRec.lastPromptAt) { $cPrompted = $true } } catch { }
+                    }
+                    if (-not $cPrompted) {
+                        Log ("refusing to clean up burned source {0}: fork {1} has no accepted prompt on record" -f $cKey, $cFork)
+                    } elseif (-not $Script:Cfg.SessionRemoveBurned) {
+                        Log 'SessionRemoveBurned is disabled - not cleaning up the burned source'
+                    } else {
+                        Remove-BurnedSource -sessionID $cKey -forkID $cFork | Out-Null
+                    }
+                }
+            }
+        }
+    }
+    if ($ResetForkCount) {
+        $rKey = $ResetForkCount.Trim()
+        if (-not $rKey) {
+            Log 'no session id given for -ResetForkCount'
+        } else {
+            Reset-SessionForkCount $rKey | Out-Null
         }
     }
     if ($UnignoreSession) {
@@ -3444,8 +5074,14 @@ if ($ForkSession -or $UnburnSession -or $ListBurned -or $UnignoreSession -or $Li
         } else {
             $fTitle = ''
             try { $fTitle = [string]$fResp.data.title } catch { }
-            $fNew = New-SessionFork -sessionID $fKey -reason 'manual' -kind 'manual' -title $fTitle -IgnoreCap
-            if ($fNew) { Log ("manual fork (depth cap ignored): {0} -> {1}" -f $fKey, $fNew) }
+            $fBefore = ''
+            $fScan = @(Get-FailedSessions -SessionID $fKey -windowMinutes 0 -freshMinutes 0 -IncludePrompted -AllAges)
+            if ($fScan.Count) { try { $fBefore = [string]$fScan[0].errMsgID } catch { } }
+            $fNew = New-SessionFork -sessionID $fKey -reason 'manual' -kind 'manual' -title $fTitle -Before $fBefore -IgnoreCap
+            if ($fNew) {
+                Log ("manual fork (depth cap ignored): {0} -> {1}" -f $fKey, $fNew)
+                if ($Script:Cfg.OpenForkInDesktop) { Open-SessionInDesktop -sessionID $fNew | Out-Null }
+            }
         }
     }
     return
@@ -3591,7 +5227,7 @@ if ($TestProbe) {
     Load-State
     Push-Location $Script:Cfg.ProjectDir
     try {
-        $new = (& opencode api post /api/session --data '{}' 2>&1) -join "`n"
+        $new = (& (Get-OpencodeCli) api post /api/session --data '{}' 2>&1) -join "`n"
         $sess = $null
         try { $sess = $new | ConvertFrom-Json } catch { }
         $sid = $null
@@ -3804,7 +5440,7 @@ function Get-HeaderLines {
         ('Next     : {0}    last failover: {1}' -f $nextLabel, $global:LastFailover),
         ('Cache    : {0} files / {1} endpoints    used: {2}    banned: {3}    burned: {4}    ignored: {5}' -f $cacheCount, $endpointCount, $usedCount, $bannedCount, $burnedCount, $ignoredCount),
         ('[T] switch now    [B] ban current    [L] bans editor    [S] failed sessions    [R] revive    [U] {0}' -f $uAction),
-        ('[C] clear used    [Q] quit'),
+        ('[C] clear used    [N] reconnect now    [Q] quit'),
         ('----------------------------------------------------------------')
     )
 }
@@ -3844,7 +5480,40 @@ function Get-ServerFromKey([string]$key) {
 
 function Get-AllKnownServers {
     if (-not $Script:State) { Load-State }
+    if (-not $Script:Bans) { Load-Bans }
     $aliasMap = Get-CachedServerAliasMap
+    $active = Get-ActiveServer
+    $activeKey = $null
+    $activeName = ''
+    if ($active) {
+        $activeKey = Get-ServerKey $active
+        try { $activeName = [string]$active.name } catch { }
+    }
+
+    # The editor list changes only when the config cache, bans, used/reliability
+    # state, or active server changes. Hashing those keeps repeated [L] opens
+    # instant without hiding a ban toggle or a fresh failover.
+    $banParts = New-Object System.Collections.Generic.List[string]
+    try {
+        foreach ($p in @($Script:Bans.PSObject.Properties)) {
+            $v = $p.Value
+            $at = ''; $kind = ''; $reason = ''; $source = ''
+            try { $at = [string]$v.at } catch { }
+            try { $kind = [string]$v.kind } catch { }
+            try { $reason = [string]$v.reason } catch { }
+            try { $source = [string]$v.source } catch { }
+            $banParts.Add(('{0}|{1}|{2}|{3}|{4}' -f $p.Name, $at, $kind, $reason, $source))
+        }
+    } catch { }
+    $usedSig = ''
+    try { $usedSig = (@($Script:State.used.PSObject.Properties.Name | Sort-Object) -join ',') } catch { }
+    $relSig = ''
+    try { $relSig = (@($Script:State.reliability.PSObject.Properties.Name | Sort-Object) -join ',') } catch { }
+    $signature = ('{0}|{1}|{2}|{3}|{4}|{5}' -f $Script:CacheAliasSignature, ((@($banParts) | Sort-Object) -join ';'), $usedSig, $relSig, $activeKey, $activeName)
+    if ($Script:AllKnownServersCache -and [string]$Script:AllKnownServersCache.Signature -eq $signature) {
+        return $Script:AllKnownServersCache.Rows
+    }
+
     $map = @{}
     $profileNames = @{}
     $ensure = {
@@ -3892,9 +5561,8 @@ function Get-AllKnownServers {
         }
     }
 
-    $active = Get-ActiveServer
     if ($active) {
-        $aKey = Get-ServerKey $active
+        $aKey = $activeKey
         if ($aKey) {
             $rec = & $ensure ([string]$active.host) ([int]$active.port) $aKey
             if ($aKey -match '#') { $rec.isProfile = $true }
@@ -3923,8 +5591,7 @@ function Get-AllKnownServers {
         if ($rel) { foreach ($prop in @($rel.PSObject.Properties)) { & $addKey ([string]$prop.Name) } }
     } catch { }
 
-    $curKey = $null
-    if ($active) { $curKey = Get-ServerKey $active }
+    $curKey = $activeKey
     $rows = New-Object System.Collections.Generic.List[object]
     foreach ($rec in $map.Values) {
         $names = @($rec.names | Where-Object { $_ })
@@ -3973,7 +5640,13 @@ function Get-AllKnownServers {
             })
         }
     }
-    return @($rows | Sort-Object sortBanned, sortBanKind, sortName, key, uid)
+    $sorted = @($rows | Sort-Object sortBanned, sortBanKind, sortName, key, uid)
+    $Script:AllKnownServersCache = [pscustomobject]@{
+        Signature = $signature
+        Rows      = $sorted
+        BuiltAt   = Get-Date
+    }
+    return $sorted
 }
 
 function Refresh-BansEditor {
@@ -4118,6 +5791,12 @@ function Start-BansEditor {
         Close-BansEditor
         return
     }
+    # Opening rebuilds/validates the catalog. Keys pressed while that happened
+    # are already satisfied by this open; drop the burst instead of letting it
+    # close the editor or move the selection.
+    $stale = Clear-ConsoleInput
+    if ($stale -gt 0) { Log ("discarded {0} repeated keypress(es) while opening the bans editor" -f $stale) }
+    $openedAt = Get-Date
     if ($Script:LayoutReady) { Render-Frame }
     $beatAt = Get-Date
     try {
@@ -4141,7 +5820,9 @@ function Start-BansEditor {
                         'Enter'      { Toggle-BansEditorSelection }
                         'R'          { Refresh-BansEditor }
                         'Escape'     { Close-BansEditor }
-                        'L'          { Close-BansEditor }
+                        # Ignore the held/repeated L that opened the editor; a
+                        # fresh L after the burst still closes it. Esc always does.
+                        'L'          { if (((Get-Date) - $openedAt).TotalMilliseconds -ge 750) { Close-BansEditor } }
                         'Q'          { Close-BansEditor }
                     }
                     if (-not $Script:BansEditor -or -not $Script:BansEditor.Active) { break }
@@ -4432,8 +6113,14 @@ if ($Watch) {
     Load-State
     $global:LastFailover = Get-Date
     $global:LastSwitchAt = $global:LastFailover
+    $Script:LastCanarySessionID = $null
     $global:FailoverPromptStart = $null
     $global:FailoverPromptEnd = $null
+    $startupGraceSec = [Math]::Max(0, [int]$Script:Cfg.StartupConnResetGraceSec)
+    $Script:StartupConnResetGraceUntil = (Get-Date).AddSeconds($startupGraceSec)
+    $Script:StartupConnResetGracePending = ($startupGraceSec -gt 0)
+    $Script:StartupTunnelRetryPending = ($startupGraceSec -gt 0)
+    $Script:StartupConnResetArmedAt = $global:LastSwitchAt
     # Ignore timeout errors that predate this watchdog run: old sessions are
     # not evidence against the currently selected server.
     try {
@@ -4441,6 +6128,12 @@ if ($Watch) {
         Save-State
     } catch { }
     Log 'watchdog starting; tracking current server as used'
+    if ($Script:StartupConnResetGracePending) {
+        Log ("startup connreset grace armed: first connection-loss failure within {0}s retries the current server once" -f $startupGraceSec)
+    }
+    if ($Script:StartupTunnelRetryPending) {
+        Log ("startup tunnel grace armed: first dead route within {0}s restarts the current server once" -f $startupGraceSec)
+    }
     $cur = Get-ActiveServer
     if ($cur) {
         Mark-Used $cur
@@ -4454,7 +6147,14 @@ if ($Watch) {
     if (-not $mutex.WaitOne(50, $false)) { Log 'another instance running - exiting'; return }
     Log 'watchdog active'
     Init-ConsoleLayout
-    $bootExit = Test-ProxyExit -tries 1
+    # Paint the dashboard and set the real window title immediately; the boot
+    # probe and the alias-map warm-up used to leave the console blank for
+    # 10-14s, which looked like a hang. Keys pressed during the two slow steps
+    # queue, but Start-BansEditor discards duplicate [L] bursts and the first
+    # failover discards stale [T]/[B] bursts.
+    if ($Interactive -and $Script:LayoutReady) { Render-Frame }
+    try { $host.UI.RawUI.WindowTitle = 'Happ Failover Watchdog' } catch { }
+    $bootExit = Test-ProxyExit -tries 1 -TimeoutSec 4
     if ($bootExit) {
         Log ("exit IP at startup: " + $bootExit)
     } else {
@@ -4475,9 +6175,10 @@ if ($Watch) {
         }
     }
     if ($Interactive) {
-        # The alias map is the only expensive part of opening the bans editor
+        # The alias map is the expensive part of the first bans-editor build
         # (PowerShell JSON parsing of every captured config). Build it once now,
-        # before keystrokes are accepted, so [L] opens instantly.
+        # before keystrokes are accepted; the editor rows themselves are memoized
+        # by Get-AllKnownServers so only the first [L] pays the remaining cost.
         try {
             $warm = [Diagnostics.Stopwatch]::StartNew()
             Get-CachedServerAliasMap | Out-Null
@@ -4486,7 +6187,6 @@ if ($Watch) {
         } catch { }
     }
     if ($Interactive -and $Script:LayoutReady) { Render-Frame }
-    try { $host.UI.RawUI.WindowTitle = 'Happ Failover Watchdog' } catch { }
     while ($true) {
         try {
             Update-CaptureMode
@@ -4497,10 +6197,10 @@ if ($Watch) {
             # failover start, not a fixed 15s margin; otherwise a quota error
             # arriving seconds after a switch could be ignored forever.
             if ($fails.rate -and $fails.rate -gt $global:LastFailover) {
-                # A quota line (per-IP free usage window exhausted) still triggers
-                # a fast switch - a fresh exit IP is the remedy - but the server
-                # itself is never banned: the quota belongs to the exit IP, not
-                # to the server. Both timestamps are after LastFailover.
+                # A quota line (free usage window exhausted) still triggers a
+                # fast switch - a fresh exit IP is the remedy - but the current
+                # server is marked used rather than banned. The canary after the
+                # switch is what tests the new server and bans it if it hits.
                 $quotaError = ($fails.quota -and $fails.rate -and $fails.quota -gt $global:LastFailover)
                 $switchCool = Get-SwitchCooldownSec
                 # Only a rate-limit error arriving right after one of our own
@@ -4513,7 +6213,7 @@ if ($Watch) {
                     Invoke-Failover -Reason 'rate-instant' -Fast
                 } elseif ($quotaError -or $now -gt $global:LastFailover.AddSeconds($switchCool)) {
                     if ($quotaError) {
-                        Log 'free usage limit detected in opencode log - switching server (no ban: the quota is per exit IP)'
+                        Log 'free usage limit detected in opencode log - switching server (canary will ban an instantly throttled target)'
                         Invoke-Failover -Reason 'quota' -Fast
                     } else {
                         Log 'rate limit detected in opencode log - fast failover starting'
@@ -4532,7 +6232,32 @@ if ($Watch) {
             # reach opencode.log reliably - scan the session API on its own cadence)
             if ($null -eq $Script:ConnResetLast -or ((Get-Date) - $Script:ConnResetLast).TotalSeconds -ge $Script:Cfg.ConnResetScanSec) {
                 $Script:ConnResetLast = Get-Date
-                $scan = Test-SessionFailureScan
+                # During the startup grace, widen only the connreset lookback so
+                # a failure recorded while the previous instance was shutting
+                # down is still found. All other scan classes keep normal rules.
+                $crWindowSec = [int]$Script:Cfg.ConnResetWindowSec
+                if (($Script:StartupConnResetGracePending -or $Script:StartupTunnelRetryPending) -and
+                    $Script:StartupConnResetArmedAt -and $global:LastSwitchAt -and
+                    $global:LastSwitchAt -gt $Script:StartupConnResetArmedAt) {
+                    if ($Script:StartupConnResetGracePending) {
+                        $Script:StartupConnResetGracePending = $false
+                        Log 'startup connreset grace cancelled: a server switch has happened since launch'
+                    }
+                    if ($Script:StartupTunnelRetryPending) {
+                        $Script:StartupTunnelRetryPending = $false
+                        Log 'startup tunnel grace cancelled: a server switch has happened since launch'
+                    }
+                }
+                if ($Script:StartupConnResetGracePending) {
+                    if ((Get-Date) -le $Script:StartupConnResetGraceUntil) {
+                        $lookSec = [Math]::Max(1, [int]$Script:Cfg.StartupConnResetLookbackMin) * 60
+                        if ($lookSec -gt $crWindowSec) { $crWindowSec = $lookSec }
+                    } else {
+                        $Script:StartupConnResetGracePending = $false
+                        Log ("startup connreset grace expired after {0}s - normal connreset rules apply" -f [int]$Script:Cfg.StartupConnResetGraceSec)
+                    }
+                }
+                $scan = Test-SessionFailureScan -ConnResetWindowSec $crWindowSec
                 # Only failures newer than the current server generation can be
                 # evidence against it. The switch timestamp also excludes errors
                 # from the previous server while it was shutting down. A later
@@ -4600,6 +6325,11 @@ if ($Watch) {
                     if ($global:LastFailover -ne $lfBefore) { $failoverStarted = $true }
                 }
                 $crCount = [int]$scan.connReset
+                if (-not $failoverStarted -and $crCount -ge 1 -and $Script:StartupConnResetGracePending) {
+                    if (Invoke-StartupConnResetRetry -FailureCount $crCount) {
+                        $failoverStarted = $true
+                    }
+                }
                 if (-not $failoverStarted -and $crCount -ge $Script:Cfg.ConnResetMinCount) {
                     if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
                         Log ("{0} connection-loss failures within {1}s - fast switching server" -f $crCount, $Script:Cfg.ConnResetWindowSec)
@@ -4644,7 +6374,13 @@ if ($Watch) {
                     $skipFailoverTick = $true
                 }
                 if (-not $skipFailoverTick -and $Script:DeadStreak -ge 2) {
-                    if ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
+                    $startupTunnelHandled = $false
+                    if ($Script:StartupTunnelRetryPending) {
+                        $startupTunnelHandled = [bool](Invoke-StartupTunnelRetry)
+                    }
+                    if ($startupTunnelHandled) {
+                        $Script:DeadStreak = 0
+                    } elseif ((Get-Date) -gt $global:LastFailover.AddSeconds((Get-SwitchCooldownSec))) {
                         Log ('network unreachable through the tunnel for ~' + ($Script:Cfg.TunnelScanSec * 2) + 's - fast switching server')
                         $Script:DeadStreak = 0
                         Invoke-Failover -Reason 'tunnel-dead' -Fast
@@ -4652,6 +6388,15 @@ if ($Watch) {
                         Log 'network unreachable but failover cooldown active - waiting'
                     }
                 }
+            }
+            # Backstop for tabs left behind by an earlier cleanup or by a tab
+            # whose title did not match at cleanup time. The immediate close in
+            # Remove-BurnedSource still handles the normal case; this sweep only
+            # runs on its own cadence and never closes a live session title.
+            if ([int]$Script:Cfg.StaleTabSweepSec -gt 0 -and
+                ($null -eq $Script:StaleTabLast -or ((Get-Date) - $Script:StaleTabLast).TotalSeconds -ge [int]$Script:Cfg.StaleTabSweepSec)) {
+                $Script:StaleTabLast = Get-Date
+                try { Close-StaleBurnedTabs -Quiet | Out-Null } catch { Log ("stale-tab sweep error: " + $_.Exception.Message) }
             }
         } catch { Log ("watch loop error: " + $_.Exception.Message) }
 
@@ -4721,6 +6466,10 @@ if ($Watch) {
                                     Log 'revive pass: no failed sessions found'
                                 }
                             }
+                            'N' {
+                                Log 'manual reconnect requested [N]'
+                                Invoke-ManualReconnect | Out-Null
+                            }
                             'U' {
                                 if ($Script:Capture) {
                                     Stop-CaptureMode
@@ -4754,4 +6503,4 @@ if ($Watch) {
     }
 }
 
-Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -CaptureAll [-CaptureSeconds N] / -ListServers / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -ResumeSession ses_id / -ResumeStale / -SessionMenu / -ListBurned / -UnburnSession ses_id / -ListIgnored / -UnignoreSession ses_id"
+Write-Host "nothing to do; use -TestInit / -TestSwitch / -TestSessions / -TestProbe / -Watch / -CaptureAll [-CaptureSeconds N] / -ListServers / -ListBanned / -BanServer host:port / -UnbanServer host:port / -ForkSession ses_id / -OpenSession ses_id / -ResumeSession ses_id / -ResumeStale / -SessionMenu / -ListBurned / -UnburnSession ses_id / -CleanupBurnedSession ses_id / -CloseStaleTabs / -ResetForkCount ses_id / -ListIgnored / -UnignoreSession ses_id"
